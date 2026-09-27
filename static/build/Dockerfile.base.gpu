@@ -1,0 +1,138 @@
+# syntax=docker/dockerfile:1
+# ==============================================================================
+# ExitBox GPU Base Image (Ubuntu + CUDA runtime)
+#
+# The default ExitBox base is Alpine. GPU workspaces cannot use it: the NVIDIA
+# container toolkit injects the host driver's userspace, which is built against
+# glibc, and every CUDA wheel is glibc-only. This flavor mirrors the Alpine base
+# package for package on an Ubuntu CUDA runtime image.
+# ==============================================================================
+
+FROM docker.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+
+# Build arguments
+ARG DELTA_VERSION=0.18.2
+ARG YQ_VERSION=4.52.2
+ARG TARGETARCH=x86_64
+ARG EXITBOX_VERSION=3.2.0
+
+# Environment variables
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Ask the container toolkit's hook for the CUDA driver libraries, not just
+# nvidia-smi. Without the compute capability the container starts with a GPU
+# device and no libcuda.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Install base packages (the Ubuntu equivalents of the Alpine base set)
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+    # Essential tools
+    ca-certificates curl wget git openssh-client bash \
+    # Editors
+    vim nano \
+    # Data processing
+    jq \
+    # Search tools
+    ripgrep fd-find fzf \
+    # File utilities
+    tree file less bat \
+    # Process utilities
+    procps htop \
+    # Archive tools
+    zip unzip xz-utils tar gzip bzip2 \
+    # Build essentials
+    make patch diffutils \
+    # Text processing
+    sed gawk gettext python3 python3-venv \
+    # Networking
+    dnsutils netcat-openbsd socat \
+    # Terminal (ncurses-term carries tmux-256color, ncurses-bin has infocmp,
+    # which the entrypoint uses to pick default-terminal)
+    tmux ncurses-term ncurses-bin \
+    # Runtime libraries
+    libstdc++6 libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu ships fd and bat under different command names; restore the usual ones
+# so the agents' instructions and user habits work unchanged.
+RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd && \
+    ln -sf /usr/bin/batcat /usr/local/bin/bat
+
+# Install yq (architecture-aware, version-pinned, checksum-verified)
+RUN if [ "$TARGETARCH" = "x86_64" ] || [ "$TARGETARCH" = "amd64" ]; then \
+        YQ_ARCH="amd64"; \
+        YQ_SHA256="a74bd266990339e0c48a2103534aef692abf99f19390d12c2b0ce6830385c459"; \
+    elif [ "$TARGETARCH" = "arm64" ] || [ "$TARGETARCH" = "aarch64" ]; then \
+        YQ_ARCH="arm64"; \
+        YQ_SHA256="c82856ac30da522f50dcdd4f53065487b5a2927e9b87ff637956900986f1f7c2"; \
+    else \
+        YQ_ARCH="amd64"; \
+        YQ_SHA256="a74bd266990339e0c48a2103534aef692abf99f19390d12c2b0ce6830385c459"; \
+    fi && \
+    curl -sL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH}" -o /usr/local/bin/yq && \
+    echo "${YQ_SHA256}  /usr/local/bin/yq" | sha256sum -c - && \
+    chmod +x /usr/local/bin/yq
+
+# Install git-delta for better diffs (gnu build for Ubuntu)
+RUN mkdir -p /usr/local/bin && \
+    if [ "$TARGETARCH" = "x86_64" ] || [ "$TARGETARCH" = "amd64" ]; then \
+        DELTA_ARCH="x86_64-unknown-linux-gnu"; \
+    elif [ "$TARGETARCH" = "arm64" ] || [ "$TARGETARCH" = "aarch64" ]; then \
+        DELTA_ARCH="aarch64-unknown-linux-gnu"; \
+    else \
+        DELTA_ARCH="x86_64-unknown-linux-gnu"; \
+    fi && \
+    wget -q -O /tmp/delta.tar.gz "https://github.com/dandavison/delta/releases/download/${DELTA_VERSION}/delta-${DELTA_VERSION}-${DELTA_ARCH}.tar.gz" && \
+    tar -xzf /tmp/delta.tar.gz -C /tmp && \
+    mv /tmp/delta-*/delta /usr/local/bin/ && \
+    rm -rf /tmp/delta*
+
+# Install rtk - token-optimized CLI wrappers (conditional, built from source).
+ARG INSTALL_RTK=false
+RUN if [ "$INSTALL_RTK" = "true" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends build-essential && \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal && \
+        . /root/.cargo/env && \
+        CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+        cargo install --git https://github.com/rtk-ai/rtk --tag v0.22.1 --locked && \
+        cp /root/.cargo/bin/rtk /usr/local/bin/rtk && \
+        chmod +x /usr/local/bin/rtk && \
+        rm -rf /root/.cargo /root/.rustup && \
+        apt-get purge -y build-essential && apt-get autoremove -y && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Stub xdg-open: no browser in container, just print the URL so OAuth
+# flows (OpenCode, Codex) show the link instead of failing with ENOENT.
+RUN printf '#!/bin/sh\necho "Open this URL in your browser:"\necho "$1"\n' \
+    > /usr/local/bin/xdg-open && chmod +x /usr/local/bin/xdg-open
+
+# Copy entrypoint
+COPY docker-entrypoint /usr/local/bin/docker-entrypoint
+RUN chmod +x /usr/local/bin/docker-entrypoint
+
+# Stay as root for entrypoint (drops to user after setup)
+WORKDIR /workspace
+
+# Configure git defaults system-wide so they apply to the runtime user.
+RUN git config --system core.pager "delta --dark" && \
+    git config --system interactive.diffFilter "delta --color-only" && \
+    git config --system delta.navigate true && \
+    git config --system delta.light false && \
+    git config --system delta.side-by-side true && \
+    git config --system merge.conflictstyle diff3 && \
+    git config --system diff.colorMoved default && \
+    git config --system init.defaultBranch main && \
+    git config --system core.editor vim
+
+# Labels
+LABEL exitbox.type="base"
+LABEL exitbox.flavor="gpu"
+LABEL exitbox.version="${EXITBOX_VERSION}"
+LABEL exitbox.rootless="true"
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]

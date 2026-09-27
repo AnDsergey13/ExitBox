@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cloud-exit/exitbox/internal/config"
 	"github.com/cloud-exit/exitbox/internal/container"
@@ -32,13 +33,25 @@ import (
 func BuildSquid(ctx context.Context, rt container.Runtime, force bool) error {
 	imageName := "exitbox-squid"
 	cmd := container.Cmd(rt)
+	cfg := config.LoadOrDefault()
+	alpine := validAlpineVersion(cfg.AlpineVersionOrDefault())
 
 	if !force && rt.ImageExists(imageName) {
 		v, _ := rt.ImageInspect(imageName, `{{index .Config.Labels "exitbox.version"}}`)
-		if v == Version {
+		a, _ := rt.ImageInspect(imageName, `{{index .Config.Labels "exitbox.alpine"}}`)
+		if a == "" {
+			a = config.DefaultAlpineVersion
+		}
+		if v == Version && a == alpine {
 			return nil
 		}
-		ui.Infof("Squid image version mismatch (%s != %s). Rebuilding...", v, Version)
+		ui.Infof("Squid image mismatch (version %s, alpine %s). Rebuilding...", v, a)
+	}
+
+	// A custom Alpine release cannot be pulled from the registry; build locally.
+	if isReleaseVersion(Version) && alpine != config.DefaultAlpineVersion {
+		ui.Infof("Custom Alpine base image (%s), building squid locally...", "alpine:"+alpine)
+		return buildSquidFull(rt, cmd, imageName)
 	}
 
 	// For release versions, try pulling the pre-built squid image from GHCR.
@@ -59,6 +72,16 @@ func BuildSquid(ctx context.Context, rt container.Runtime, force bool) error {
 	return buildSquidFull(rt, cmd, imageName)
 }
 
+// templateSquidDockerfile renders the embedded squid Dockerfile with the
+// configured Alpine release.
+func templateSquidDockerfile(cfg *config.Config) []byte {
+	version := validAlpineVersion(cfg.AlpineVersionOrDefault())
+	from := "FROM alpine:" + config.DefaultAlpineVersion
+	sq := strings.ReplaceAll(string(static.DockerfileSquid), from, "FROM alpine:"+version)
+	sq += fmt.Sprintf("\nLABEL exitbox.alpine=\"%s\"\n", version)
+	return []byte(sq)
+}
+
 // buildSquidFull builds the squid image locally from the embedded Dockerfile.
 func buildSquidFull(rt container.Runtime, cmd, imageName string) error {
 	ui.Info("Building Squid proxy image...")
@@ -68,7 +91,8 @@ func buildSquidFull(rt container.Runtime, cmd, imageName string) error {
 		return fmt.Errorf("failed to create build context dir: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(buildCtx, "Dockerfile"), static.DockerfileSquid, 0644); err != nil {
+	cfg := config.LoadOrDefault()
+	if err := os.WriteFile(filepath.Join(buildCtx, "Dockerfile"), templateSquidDockerfile(cfg), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile: %w", err)
 	}
 

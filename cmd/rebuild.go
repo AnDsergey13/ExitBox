@@ -96,7 +96,7 @@ Examples:
 			}
 			// Set AgentVersion so BuildTools -> BuildCore also uses the pin
 			image.AgentVersion = version
-			if err := image.BuildCore(ctx, rt, agentName, true, version); err != nil {
+			if err := image.BuildCore(ctx, rt, agentName, true, version, image.WorkspaceDistro(cfg, projectDir, rebuildWorkspace)); err != nil {
 				ui.Errorf("Failed to rebuild %s core image: %v", a.DisplayName(), err)
 			}
 			if err := image.BuildProject(ctx, rt, agentName, projectDir, rebuildWorkspace, true); err != nil {

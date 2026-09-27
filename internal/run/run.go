@@ -31,9 +31,11 @@ import (
 	"github.com/cloud-exit/exitbox/internal/config"
 	"github.com/cloud-exit/exitbox/internal/container"
 	"github.com/cloud-exit/exitbox/internal/generate"
+	"github.com/cloud-exit/exitbox/internal/gpu"
 	"github.com/cloud-exit/exitbox/internal/ipc"
 	"github.com/cloud-exit/exitbox/internal/network"
 	"github.com/cloud-exit/exitbox/internal/platform"
+	"github.com/cloud-exit/exitbox/internal/plugins"
 	"github.com/cloud-exit/exitbox/internal/profile"
 	"github.com/cloud-exit/exitbox/internal/project"
 	"github.com/cloud-exit/exitbox/internal/redactor"
@@ -101,6 +103,18 @@ func AgentContainer(rt container.Runtime, opts Options) (int, error) {
 	activeWorkspace, err := profile.ResolveActiveWorkspace(cfg, opts.ProjectDir, opts.WorkspaceOverride)
 	if err != nil {
 		return 1, fmt.Errorf("failed to resolve active workspace: %w", err)
+	}
+
+	// Plugins enabled for this agent in the active workspace: their settings
+	// travel into the container as environment variables, and the domains
+	// they need are allowed through the firewall for this session.
+	var pluginEnv []string
+	if activeWorkspace != nil {
+		ws := &activeWorkspace.Workspace
+		pluginEnv = plugins.EnvVars(ws, opts.Agent)
+		if !opts.NoFirewall {
+			opts.AllowURLs = append(opts.AllowURLs, plugins.Domains(ws, opts.Agent)...)
+		}
 	}
 
 	// Detect hosts in agent config and offer to permanently allow them through the firewall.
@@ -246,6 +260,26 @@ func AgentContainer(rt container.Runtime, opts Options) (int, error) {
 		gitconfig := filepath.Join(os.Getenv("HOME"), ".gitconfig")
 		if info, err := os.Stat(gitconfig); err == nil && !info.IsDir() {
 			args = append(args, "-v", gitconfig+":/home/user/.gitconfig:ro")
+		}
+	}
+
+	// Experimental GPU passthrough, enabled per workspace. Detection runs
+	// first so a missing driver or container toolkit is named here instead
+	// of surfacing later as a container that simply has no GPU.
+	if activeWorkspace != nil && activeWorkspace.Workspace.GPU {
+		support := gpu.Detect(cmd)
+		if support.Available() {
+			args = append(args, gpu.Args(cmd, support)...)
+			for _, ev := range gpu.EnvVars(support) {
+				args = append(args, "-e", ev)
+			}
+			args = append(args, "-e", "EXITBOX_GPU=true")
+		} else {
+			ui.Warnf("GPU passthrough is enabled for workspace '%s' but the host cannot provide it:", activeWorkspace.Workspace.Name)
+			for _, problem := range support.Problems {
+				ui.Warnf("  - %s", problem)
+			}
+			ui.Warn("Continuing without GPU access. Run `exitbox gpu status` for details.")
 		}
 	}
 
@@ -416,6 +450,9 @@ func AgentContainer(rt container.Runtime, opts Options) (int, error) {
 	if opts.RTK {
 		args = append(args, "-e", "EXITBOX_RTK=true")
 	}
+	for _, ev := range pluginEnv {
+		args = append(args, "-e", ev)
+	}
 	if opts.Ollama {
 		args = append(args, ollamaEnvVars(opts.Agent)...)
 	}
@@ -541,6 +578,8 @@ func isReservedEnvVar(key string) bool {
 		"EXITBOX_VAULT_ENABLED":   true,
 		"EXITBOX_VAULT_READONLY":  true,
 		"EXITBOX_RTK":             true,
+		"EXITBOX_GPU":             true,
+		"EXITBOX_PLUGINS":         true,
 		"EXITBOX_IDE_PORT":        true,
 		"CLAUDE_CODE_SSE_PORT":    true,
 		"ENABLE_IDE_INTEGRATION":  true,
@@ -552,6 +591,11 @@ func isReservedEnvVar(key string) bool {
 		"no_proxy":                true,
 		"NO_PROXY":                true,
 		"SSH_AUTH_SOCK":           true,
+	}
+	if strings.HasPrefix(key, "EXITBOX_PLUGIN_") {
+		// Plugin settings are rendered from config; a hand-passed value
+		// would silently disagree with what `exitbox plugins` shows.
+		return true
 	}
 	return reserved[key]
 }

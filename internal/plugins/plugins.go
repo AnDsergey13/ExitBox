@@ -11,7 +11,8 @@ import (
 	"github.com/cloud-exit/exitbox/internal/fsutil"
 )
 
-type Plugin struct {
+// Installed is a marketplace plugin cloned into the current project.
+type Installed struct {
 	Name string
 	Dir  string
 }
@@ -63,7 +64,7 @@ func projectMarketplaceFile(projectDir, agentName string) (string, error) {
 }
 
 // List returns installed plugin repositories for an agent in the current project.
-func List(projectDir, agentName string) ([]Plugin, error) {
+func List(projectDir, agentName string) ([]Installed, error) {
 	root, err := ProjectPluginsDir(projectDir, agentName)
 	if err != nil {
 		return nil, err
@@ -76,12 +77,12 @@ func List(projectDir, agentName string) ([]Plugin, error) {
 		return nil, err
 	}
 
-	var result []Plugin
+	var result []Installed
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		result = append(result, Plugin{
+		result = append(result, Installed{
 			Name: entry.Name(),
 			Dir:  filepath.Join(root, entry.Name()),
 		})
@@ -92,7 +93,7 @@ func List(projectDir, agentName string) ([]Plugin, error) {
 // Install imports a Codex marketplace repo into the current project by copying
 // its referenced local plugins into ./plugins and merging marketplace entries
 // into ./.agents/plugins/marketplace.json.
-func Install(projectDir, agentName, source, name string) ([]Plugin, error) {
+func Install(projectDir, agentName, source, name string) ([]Installed, error) {
 	if _, err := ProjectPluginsDir(projectDir, agentName); err != nil {
 		return nil, err
 	}
@@ -135,7 +136,7 @@ func Install(projectDir, agentName, source, name string) ([]Plugin, error) {
 		return nil, fmt.Errorf("creating plugin root: %w", err)
 	}
 
-	var installed []Plugin
+	var installed []Installed
 	var importedEntries []marketplaceItem
 	for _, entry := range repoMarketplace.Plugins {
 		if name != "" && entry.Name != name {
@@ -162,7 +163,7 @@ func Install(projectDir, agentName, source, name string) ([]Plugin, error) {
 		}
 		entry.Source.Path = "./plugins/" + entry.Name
 		importedEntries = append(importedEntries, entry)
-		installed = append(installed, Plugin{Name: entry.Name, Dir: destPath})
+		installed = append(installed, Installed{Name: entry.Name, Dir: destPath})
 	}
 
 	if len(installed) == 0 {

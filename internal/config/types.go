@@ -47,6 +47,13 @@ type Workspace struct {
 	Packages    []string    `yaml:"packages,omitempty"`
 	Directory   string      `yaml:"directory,omitempty"`
 	Vault       VaultConfig `yaml:"vault,omitempty"`
+	// GPU enables experimental GPU passthrough for containers started with
+	// this workspace. It requires a working host GPU runtime (NVIDIA
+	// Container Toolkit / CDI) and is off by default.
+	GPU bool `yaml:"gpu,omitempty"`
+	// Plugins holds per-agent plugin configuration for this workspace,
+	// keyed by agent name and then by plugin name.
+	Plugins PluginMap `yaml:"plugins,omitempty"`
 }
 
 // AgentConfig holds enable/disable state for each agent.
@@ -67,10 +74,14 @@ type AgentEntry struct {
 	Version string `yaml:"version,omitempty"`
 }
 
-// ToolsConfig holds user-specified extra packages.
+// ToolsConfig holds user-specified extra packages and pinned tool versions.
 type ToolsConfig struct {
 	User     []string       `yaml:"user,omitempty"`
 	Binaries []BinaryConfig `yaml:"binaries,omitempty"`
+	// Versions pins a tool or language to a specific version. The special
+	// value "latest" tracks the newest upstream version at image build time,
+	// and an empty/missing entry uses the built-in default.
+	Versions map[string]string `yaml:"versions,omitempty"`
 }
 
 // BinaryConfig represents a tool installed via direct download.
@@ -79,14 +90,55 @@ type BinaryConfig struct {
 	URLPattern string `yaml:"url"` // URL with {arch} placeholder (amd64/arm64)
 }
 
+// GetToolVersion returns the configured version for a managed tool or
+// language. An empty string means the built-in default (e.g. the Alpine
+// package version for apk-installed tools).
+func (c *Config) GetToolVersion(name string) string {
+	if c == nil || c.Tools.Versions == nil {
+		return ""
+	}
+	return c.Tools.Versions[name]
+}
+
+// SetToolVersion pins a managed tool to version. An empty version or the
+// special value "default" removes the pin and restores the built-in default.
+func (c *Config) SetToolVersion(name, version string) {
+	if c == nil {
+		return
+	}
+	if c.Tools.Versions == nil {
+		c.Tools.Versions = make(map[string]string)
+	}
+	if version == "" || version == "default" {
+		delete(c.Tools.Versions, name)
+		return
+	}
+	c.Tools.Versions[name] = version
+}
+
 // SettingsConfig holds global settings.
 type SettingsConfig struct {
 	AutoUpdate       bool              `yaml:"auto_update"`
+	AutoUpdateTools  bool              `yaml:"auto_update_tools"`
+	AlpineVersion    string            `yaml:"alpine_version,omitempty"` // base image Alpine release, e.g. "3.21"
 	StatusBar        bool              `yaml:"status_bar"`
 	RTK              bool              `yaml:"rtk"`
 	DefaultWorkspace string            `yaml:"default_workspace,omitempty"`
 	DefaultFlags     DefaultFlags      `yaml:"default_flags"`
 	Keybindings      KeybindingsConfig `yaml:"keybindings,omitempty"`
+}
+
+// DefaultAlpineVersion is the Alpine release used when no base image
+// version is configured.
+const DefaultAlpineVersion = "3.21"
+
+// AlpineVersionOrDefault returns the configured base image Alpine release,
+// falling back to DefaultAlpineVersion when unset.
+func (c *Config) AlpineVersionOrDefault() string {
+	if c == nil || c.Settings.AlpineVersion == "" {
+		return DefaultAlpineVersion
+	}
+	return c.Settings.AlpineVersion
 }
 
 // KeybindingsConfig holds configurable tmux keybinding overrides.

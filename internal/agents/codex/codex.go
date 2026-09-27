@@ -55,6 +55,23 @@ func (c *Codex) BinaryName() string {
 	}
 }
 
+// PackageName returns the release asset holding the complete Codex package:
+// bin/codex, bin/codex-code-mode-host, codex-package.json, codex-path/rg and
+// codex-resources/bwrap. Codex resolves its install layout from the running
+// executable, and its app-server daemon refuses to start from a bare binary
+// ("this CLI has no complete local package"), so this is the asset ExitBox
+// installs. The musl build is static and runs on both image flavors.
+func (c *Codex) PackageName() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "codex-package-x86_64-unknown-linux-musl.tar.gz"
+	case "arm64":
+		return "codex-package-aarch64-unknown-linux-musl.tar.gz"
+	default:
+		return ""
+	}
+}
+
 // CodeModeHostBinaryName returns the release tarball for codex-code-mode-host, the
 // sibling binary recent Codex versions spawn for code review / "code mode". It ships
 // as a separate release asset and must be installed alongside the codex binary.

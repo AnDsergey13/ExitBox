@@ -22,8 +22,14 @@ import _ "embed"
 //go:embed build/Dockerfile.base
 var DockerfileBase []byte
 
+//go:embed build/Dockerfile.base.gpu
+var DockerfileBaseGPU []byte
+
 //go:embed build/Dockerfile.local
 var DockerfileLocal []byte
+
+//go:embed build/Dockerfile.local.gpu
+var DockerfileLocalGPU []byte
 
 //go:embed build/Dockerfile.squid
 var DockerfileSquid []byte

@@ -8,6 +8,11 @@ import (
 )
 
 func (o *OpenCode) GetDockerfileInstall(buildCtx string) (string, error) {
+	return o.installSnippet(agent.PrepareBuildInput{})
+}
+
+// installSnippet renders the install step for the image flavor being built.
+func (o *OpenCode) installSnippet(in agent.PrepareBuildInput) (string, error) {
 	if o.NpmPackageName() == "" {
 		return "", fmt.Errorf("unsupported architecture for OpenCode")
 	}
@@ -18,7 +23,7 @@ func (o *OpenCode) GetDockerfileInstall(buildCtx string) (string, error) {
 ARG OPENCODE_VERSION
 ARG GITHUB_TOKEN
 RUN set -e && \
-    apk add --no-cache curl jq && \
+    ` + in.InlineInstall("curl", "jq") + ` && \
     case "$(uname -m)" in \
         x86_64|amd64) OC_ARCH="x64" ;; \
         aarch64|arm64) OC_ARCH="arm64" ;; \
@@ -66,13 +71,17 @@ RUN set -e && \
 
 // GetFullDockerfile returns the complete Dockerfile for OpenCode.
 func (o *OpenCode) GetFullDockerfile(version string) (string, error) {
-	install, err := o.GetDockerfileInstall("")
+	return o.fullDockerfile(agent.PrepareBuildInput{Version: version})
+}
+
+func (o *OpenCode) fullDockerfile(in agent.PrepareBuildInput) (string, error) {
+	install, err := o.installSnippet(in)
 	if err != nil {
 		return "", err
 	}
-	df := "FROM exitbox-base\n\n"
-	if version != "" {
-		df += fmt.Sprintf("ARG OPENCODE_VERSION=%s\n", version)
+	df := "FROM " + in.Base() + "\n\n"
+	if in.Version != "" {
+		df += fmt.Sprintf("ARG OPENCODE_VERSION=%s\n", in.Version)
 	}
 	df += install
 	return df, nil
@@ -90,12 +99,11 @@ func (o *OpenCode) PrepareBuild(in agent.PrepareBuildInput) error {
 	if in.Logf != nil {
 		in.Logf("Building OpenCode image with version %s (GitHub release tarball, SHA-256 verified)", version)
 	}
-	df := fmt.Sprintf("FROM exitbox-base\n\nARG OPENCODE_VERSION=%s\n", version)
-	install, err := o.GetDockerfileInstall(in.BuildDir)
+	in.Version = version
+	df, err := o.fullDockerfile(in)
 	if err != nil {
 		return fmt.Errorf("failed to get OpenCode install instructions: %w", err)
 	}
-	df += install
 	if err := os.WriteFile(in.DockerfilePath, []byte(df), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile: %w", err)
 	}

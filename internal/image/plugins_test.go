@@ -1,0 +1,100 @@
+// ExitBox - Multi-Agent Container Sandbox
+// Copyright (C) 2026 Cloud Exit B.V.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package image
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/cloud-exit/exitbox/internal/config"
+	"github.com/cloud-exit/exitbox/internal/distro"
+	"github.com/cloud-exit/exitbox/internal/plugins"
+)
+
+func workspaceWithPlugin() *config.Workspace {
+	ws := &config.Workspace{Name: "default"}
+	ws.SetPluginEntry("codex", "codex-router", config.PluginEntry{Enabled: true})
+	return ws
+}
+
+func TestPluginsImageName(t *testing.T) {
+	if got := PluginsImageName("codex", "abc123", distro.Default()); got != "exitbox-codex-plugins-abc123" {
+		t.Errorf("PluginsImageName() = %q", got)
+	}
+	if got := ToolsImageName("codex", distro.Default()); got != "exitbox-codex-tools" {
+		t.Errorf("ToolsImageName() = %q", got)
+	}
+}
+
+func TestPluginsDockerfile(t *testing.T) {
+	ws := workspaceWithPlugin()
+	hash := plugins.BuildHash(ws, "codex")
+	df := PluginsDockerfile(ws, "codex", "exitbox-codex-tools", hash, distro.Default())
+
+	for _, want := range []string{
+		"FROM exitbox-codex-tools",
+		"USER root",
+		"codex-router",
+		`LABEL exitbox.plugins.hash="` + hash + `"`,
+	} {
+		if !strings.Contains(df, want) {
+			t.Errorf("Dockerfile missing %q:\n%s", want, df)
+		}
+	}
+}
+
+func TestPluginsDockerfileEmptyWithoutPlugins(t *testing.T) {
+	ws := &config.Workspace{Name: "default"}
+	if df := PluginsDockerfile(ws, "codex", "exitbox-codex-tools", "", distro.Default()); df != "" {
+		t.Errorf("Dockerfile = %q, want empty when no plugin is enabled", df)
+	}
+	// A plugin enabled for another agent must not leak into this layer.
+	ws.SetPluginEntry("claude", "codex-router", config.PluginEntry{Enabled: true})
+	if df := PluginsDockerfile(ws, "codex", "exitbox-codex-tools", "", distro.Default()); df != "" {
+		t.Errorf("Dockerfile = %q, want empty for an agent without plugins", df)
+	}
+}
+
+func TestWorkspaceHashIncludesPlugins(t *testing.T) {
+	dir := t.TempDir()
+	base := config.DefaultConfig()
+	withPlugin := config.DefaultConfig()
+	ws := withPlugin.Workspace("default")
+	if ws == nil {
+		t.Fatal("default workspace missing")
+	}
+	ws.SetPluginEntry("codex", "codex-router", config.PluginEntry{Enabled: true})
+
+	if WorkspaceHash(base, "codex", dir, "") == WorkspaceHash(withPlugin, "codex", dir, "") {
+		t.Error("WorkspaceHash should change when a plugin is enabled")
+	}
+	// Another agent's project image is unaffected.
+	if WorkspaceHash(base, "qwen", dir, "") != WorkspaceHash(withPlugin, "qwen", dir, "") {
+		t.Error("WorkspaceHash for an agent without the plugin should not change")
+	}
+}
+
+func TestWorkspaceHashIncludesGPU(t *testing.T) {
+	dir := t.TempDir()
+	base := config.DefaultConfig()
+	withGPU := config.DefaultConfig()
+	withGPU.Workspace("default").GPU = true
+
+	if WorkspaceHash(base, "codex", dir, "") == WorkspaceHash(withGPU, "codex", dir, "") {
+		t.Error("WorkspaceHash should change when GPU passthrough is enabled")
+	}
+}

@@ -30,25 +30,31 @@ import (
 const kimiNPMPackage = "@moonshot-ai/kimi-code"
 
 func (k *Kimi) GetDockerfileInstall(buildCtx string) (string, error) {
+	return k.installSnippet(agent.PrepareBuildInput{}), nil
+}
+
+// installSnippet renders the install step for the image flavor being built.
+func (k *Kimi) installSnippet(in agent.PrepareBuildInput) string {
 	return `# Install Node.js and the Kimi Code CLI via npm
 ARG KIMI_VERSION
-` + jstools.InstallDependencies([]string{"nodejs", "npm"}, []string{kimiNPMPackage + "@${KIMI_VERSION}"}) + ` && \
+` + jstools.InstallDependenciesFor(in, []string{"nodejs", "npm"}, []string{kimiNPMPackage + "@${KIMI_VERSION}"}) + ` && \
     kimi --version
-LABEL exitbox.agent.version="${KIMI_VERSION}"`, nil
+LABEL exitbox.agent.version="${KIMI_VERSION}"`
 }
 
 func (k *Kimi) GetFullDockerfile(version string) (string, error) {
-	install, err := k.GetDockerfileInstall("")
-	if err != nil {
-		return "", err
-	}
-	df := "FROM exitbox-base\n\n"
+	return k.fullDockerfile(agent.PrepareBuildInput{Version: version}), nil
+}
+
+func (k *Kimi) fullDockerfile(in agent.PrepareBuildInput) string {
+	version := in.Version
 	if version == "" {
 		version = "latest"
 	}
+	df := "FROM " + in.Base() + "\n\n"
 	df += fmt.Sprintf("ARG KIMI_VERSION=%s\n", version)
-	df += install
-	return df, nil
+	df += k.installSnippet(in)
+	return df
 }
 
 func (k *Kimi) PrepareBuild(in agent.PrepareBuildInput) error {
@@ -63,10 +69,8 @@ func (k *Kimi) PrepareBuild(in agent.PrepareBuildInput) error {
 	if in.Logf != nil {
 		in.Logf("Building Kimi Code CLI image with version %s (npm install at build time)", version)
 	}
-	df, err := k.GetFullDockerfile(version)
-	if err != nil {
-		return err
-	}
+	in.Version = version
+	df := k.fullDockerfile(in)
 	if err := os.WriteFile(in.DockerfilePath, []byte(df), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile: %w", err)
 	}

@@ -162,3 +162,22 @@ func TestNewIPCServer_AllowDomainHandler_OnlyWithFirewall(t *testing.T) {
 		t.Error("allow_domain handler present with firewall disabled; should be absent")
 	}
 }
+
+func TestIsReservedEnvVar_PluginSettings(t *testing.T) {
+	// Plugin settings are rendered from the workspace config; a hand-passed
+	// value would silently disagree with what `exitbox plugins` shows.
+	reserved := []string{
+		"EXITBOX_PLUGINS",
+		"EXITBOX_GPU",
+		"EXITBOX_PLUGIN_CODEX_ROUTER_PROVIDERS",
+		"EXITBOX_PLUGIN_CODEX_ROUTER_ANTHROPIC_API_KEY",
+	}
+	for _, key := range reserved {
+		if !isReservedEnvVar(key) {
+			t.Errorf("isReservedEnvVar(%q) = false, want true", key)
+		}
+	}
+	if isReservedEnvVar("MY_PLUGIN_SETTING") {
+		t.Error("only EXITBOX_PLUGIN_* names are reserved")
+	}
+}

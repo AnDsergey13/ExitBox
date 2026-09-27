@@ -27,25 +27,31 @@ import (
 const qwenNPMPackage = "@qwen-code/qwen-code"
 
 func (q *Qwen) GetDockerfileInstall(buildCtx string) (string, error) {
+	return q.installSnippet(agent.PrepareBuildInput{}), nil
+}
+
+// installSnippet renders the install step for the image flavor being built.
+func (q *Qwen) installSnippet(in agent.PrepareBuildInput) string {
 	return `# Install Node.js and Qwen Code via npm (requires Node 20+)
 ARG QWEN_VERSION
-` + jstools.InstallDependencies([]string{"nodejs", "npm"}, []string{qwenNPMPackage + "@${QWEN_VERSION}"}) + ` && \
+` + jstools.InstallDependenciesFor(in, []string{"nodejs", "npm"}, []string{qwenNPMPackage + "@${QWEN_VERSION}"}) + ` && \
     qwen --version
-LABEL exitbox.agent.version="${QWEN_VERSION}"`, nil
+LABEL exitbox.agent.version="${QWEN_VERSION}"`
 }
 
 func (q *Qwen) GetFullDockerfile(version string) (string, error) {
-	install, err := q.GetDockerfileInstall("")
-	if err != nil {
-		return "", err
-	}
-	df := "FROM exitbox-base\n\n"
+	return q.fullDockerfile(agent.PrepareBuildInput{Version: version}), nil
+}
+
+func (q *Qwen) fullDockerfile(in agent.PrepareBuildInput) string {
+	version := in.Version
 	if version == "" {
 		version = "latest"
 	}
+	df := "FROM " + in.Base() + "\n\n"
 	df += fmt.Sprintf("ARG QWEN_VERSION=%s\n", version)
-	df += install
-	return df, nil
+	df += q.installSnippet(in)
+	return df
 }
 
 func (q *Qwen) PrepareBuild(in agent.PrepareBuildInput) error {
@@ -60,10 +66,8 @@ func (q *Qwen) PrepareBuild(in agent.PrepareBuildInput) error {
 	if in.Logf != nil {
 		in.Logf("Building Qwen Code image with version %s (npm install at build time)", version)
 	}
-	df, err := q.GetFullDockerfile(version)
-	if err != nil {
-		return err
-	}
+	in.Version = version
+	df := q.fullDockerfile(in)
 	if err := os.WriteFile(in.DockerfilePath, []byte(df), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile: %w", err)
 	}

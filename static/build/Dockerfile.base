@@ -4,7 +4,7 @@
 # Minimal, security-focused base with working firewall
 # ==============================================================================
 
-FROM alpine:3.21
+FROM docker.io/library/alpine:3.21
 
 # Build arguments
 ARG DELTA_VERSION=0.18.2

@@ -63,9 +63,26 @@ update_tmux_status() {
     tmux set -g status-right " ${ver}  ${KB_WORKSPACE_MENU}: workspaces  ${KB_SESSION_MENU}: sessions " 2>/dev/null || true
 }
 
+# tmux_supports_extended_keys_format reports whether this tmux knows the
+# extended-keys-format option, which arrived in tmux 3.5. Older tmux (Ubuntu
+# 24.04, and therefore the GPU image flavor, ships 3.4) aborts the config
+# line with "invalid option" on every session start.
+tmux_supports_extended_keys_format() {
+    local version major minor
+    version="$(tmux -V 2>/dev/null | awk '{print $2}')"
+    version="${version//[!0-9.]/}"
+    [[ "$version" == *.* ]] || return 1
+    major="${version%%.*}"
+    minor="${version#*.}"
+    minor="${minor%%.*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    (( major > 3 )) && return 0
+    (( major == 3 && minor >= 5 ))
+}
+
 write_tmux_conf() {
     local conf="/tmp/exitbox-tmux.conf"
-    local display ws_name ver session_name default_term
+    local display ws_name ver session_name default_term extkeys_format
     display="$(agent_display_name "$AGENT")"
     ws_name="${EXITBOX_WORKSPACE_NAME:-default}"
     ver="${EXITBOX_VERSION:-dev}"
@@ -81,6 +98,14 @@ write_tmux_conf() {
         default_term="xterm-256color"
     fi
 
+    # csi-u encoding is only selectable from tmux 3.5 on; older tmux keeps its
+    # xterm encoding, so modified Enter reaches fewer agents but nothing errors.
+    if tmux_supports_extended_keys_format; then
+        extkeys_format="set -g extended-keys-format csi-u"
+    else
+        extkeys_format="# extended-keys-format needs tmux 3.5+; this tmux is older"
+    fi
+
     cat > "$conf" <<TMUXEOF
 # ExitBox tmux configuration
 set -g default-terminal "${default_term}"
@@ -91,7 +116,7 @@ set -g default-terminal "${default_term}"
 # extended-keys-format must be csi-u (fixterms): tmux's default "xterm" encoding
 # is undecodable by Pi and other Kitty-protocol agents, so modified Enter is lost.
 set -g extended-keys on
-set -g extended-keys-format csi-u
+${extkeys_format}
 set -as terminal-features "*:extkeys"
 set -g status-position top
 set -g status-style "bg=colour236,fg=colour255"
@@ -1048,6 +1073,7 @@ run_agent_loop() {
         inject_codex_approval_rules
         link_skills
         setup_graphify
+        setup_plugins
     fi
 
     build_resume_args "$@"
@@ -1316,6 +1342,180 @@ setup_graphify() {
         # previously installed graphify skill. File-based so it works without the CLI.
         [[ -n "$skill_dir" ]] && rm -rf "$skill_dir" 2>/dev/null
     fi
+}
+
+# ============================================================================
+# GPU
+# ============================================================================
+
+setup_gpu() {
+    # Report what GPU passthrough actually delivered. Enabling it on the host
+    # is three separate things (driver, container toolkit, workspace flag),
+    # and a container that silently comes up without a GPU is the confusing
+    # failure this replaces.
+    [[ "${EXITBOX_GPU:-}" == "true" ]] || return 0
+
+    local devices libcuda
+    devices="$(ls -d /dev/nvidia* 2>/dev/null | tr '\n' ' ')"
+    if [[ -z "$devices" ]]; then
+        echo "[WARN] GPU passthrough is enabled but no /dev/nvidia* device node is visible here." >&2
+        echo "[WARN] The container runtime attached no GPU. Check 'exitbox gpu status' on the host." >&2
+        return 0
+    fi
+
+    libcuda="$(find /usr/lib /usr/lib64 /usr/local/lib /usr/local/nvidia/lib64 -maxdepth 2 -name 'libcuda.so*' 2>/dev/null | head -1)"
+    if [[ -z "$libcuda" ]]; then
+        echo "[WARN] GPU devices are visible (${devices}) but no CUDA driver library was injected." >&2
+        echo "[WARN] The container toolkit hook injects it only for NVIDIA_DRIVER_CAPABILITIES=compute." >&2
+    fi
+
+    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+        echo "[WARN] nvidia-smi did not run. $(gpu_userspace_hint)" >&2
+    fi
+}
+
+# gpu_userspace_hint explains a failed nvidia-smi for the image flavor this
+# container runs. The Alpine image cannot load the glibc driver userspace the
+# container toolkit injects; the CUDA flavor can, so there the fault is on the
+# host side.
+gpu_userspace_hint() {
+    local marker="${1:-/etc/alpine-release}"
+    if [[ -f "$marker" ]]; then
+        printf '%s' "This image is Alpine/musl and the injected driver userspace is glibc. Enable GPU for this workspace (exitbox setup) so it builds on the CUDA image."
+    else
+        printf '%s' "The devices are attached but the driver userspace did not load; check 'exitbox gpu status' on the host."
+    fi
+}
+
+# ============================================================================
+# PLUGINS
+# ============================================================================
+
+# plugin_env_var renders the environment variable carrying one plugin
+# setting, matching the name ExitBox generates on the host
+# (EXITBOX_PLUGIN_<PLUGIN>_<KEY>, uppercased, dashes as underscores).
+plugin_env_var() {
+    local name="EXITBOX_PLUGIN_${1}_${2}"
+    name="${name//-/_}"
+    printf '%s' "${name^^}"
+}
+
+# plugin_setting prints one plugin setting value. A "vault:KEY" value is a
+# reference, not a secret: it is resolved through the host vault here and
+# never written to disk or echoed anywhere else.
+plugin_setting() {
+    local var value
+    var="$(plugin_env_var "$1" "$2")"
+    value="${!var:-}"
+    case "$value" in
+        vault:*)
+            command -v exitbox-vault >/dev/null 2>&1 || return 1
+            exitbox-vault get "${value#vault:}" 2>/dev/null || return 1
+            ;;
+        *)
+            printf '%s' "$value"
+            ;;
+    esac
+}
+
+setup_plugins() {
+    # Plugins enabled for this agent are baked into the image; this applies
+    # their per-workspace configuration at container start.
+    [[ -n "${EXITBOX_PLUGINS:-}" ]] || return 0
+    local name
+    for name in ${EXITBOX_PLUGINS//,/ }; do
+        case "$name" in
+            codex-router) setup_codex_router ;;
+            *) echo "[WARN] Unknown plugin '$name' - skipped" >&2 ;;
+        esac
+    done
+}
+
+# codex_router_provider_env maps a router provider id to the environment
+# variable its catalog reads for that provider's API key. The mapping comes
+# from the installed plugin's own config tree, so it cannot drift from the
+# version baked into the image.
+codex_router_provider_env() {
+    local id="$1" root="${CODEX_ROUTER_SOURCE_ROOT:-/opt/exitbox/plugins/codex-router}"
+    command -v jq >/dev/null 2>&1 || return 1
+    jq -r --arg id "$id" \
+        '.providers[]? | select(.id == $id) | .credential.environment[0] // empty' \
+        "$root"/config/*/*.json 2>/dev/null | head -1
+}
+
+# codex_router_state_dir returns the per-agent directory holding the router's
+# state. It must live under a path ExitBox mounts for that agent, or provider
+# credentials and catalogs would be lost on every container start.
+codex_router_state_dir() {
+    case "$1" in
+        claude) echo "$HOME/.claude/codex-router" ;;
+        cursor) echo "$HOME/.cursor/codex-router" ;;
+        *)      echo "$HOME/.codex/codex-router" ;;
+    esac
+}
+
+setup_codex_router() {
+    local target state_dir providers provider port auto_start env_var key marker
+    if ! command -v model-router >/dev/null 2>&1; then
+        echo "[WARN] codex-router is enabled but not installed in this image." >&2
+        echo "[WARN] Rebuild it with: exitbox rebuild ${AGENT}" >&2
+        return 0
+    fi
+    # The router configures one client per run; agents it cannot target are
+    # left untouched.
+    case "$AGENT" in
+        codex|claude|cursor) target="$AGENT" ;;
+        *) return 0 ;;
+    esac
+
+    # State (provider credentials, catalogs) lives in the agent config dir,
+    # which is mounted per workspace, so it survives image rebuilds. Each
+    # target keeps its own state under the directory that agent mounts.
+    state_dir="$(codex_router_state_dir "$target")"
+    mkdir -p "$state_dir" 2>/dev/null || true
+    export CODEX_ROUTER_STATE_DIR="$state_dir"
+
+    port="$(plugin_setting codex-router port)" || port=""
+    [[ -n "$port" ]] && export CODEX_ROUTER_PORT="$port"
+
+    providers="$(plugin_setting codex-router providers)" || providers=""
+    if [[ -z "$providers" ]]; then
+        echo "[INFO] codex-router: no providers configured. Run: exitbox plugins edit ${AGENT} codex-router" >&2
+        return 0
+    fi
+
+    # Provider keys enter the router through the environment variables it
+    # already reads. The router service is started from this shell below, so
+    # it inherits them; nothing is written to disk.
+    for provider in ${providers//,/ }; do
+        env_var="$(codex_router_provider_env "$provider")"
+        [[ -n "$env_var" ]] || continue
+        key="$(plugin_setting codex-router "${provider}_key")" || key=""
+        [[ -n "$key" ]] || continue
+        export "${env_var}=${key}"
+        unset key
+    done
+
+    marker="${state_dir}/.exitbox-providers"
+    if [[ "$(cat "$marker" 2>/dev/null)" != "$providers" ]]; then
+        if model-router "$target" setup --no-tray --providers "$providers" >"${state_dir}/exitbox-setup.log" 2>&1; then
+            printf '%s' "$providers" > "$marker"
+        else
+            echo "[WARN] codex-router: setup failed. See ${state_dir}/exitbox-setup.log" >&2
+            return 0
+        fi
+    elif ! model-router "$target" enable >>"${state_dir}/exitbox-setup.log" 2>&1; then
+        echo "[WARN] codex-router: could not publish routes to ${target}" >&2
+        return 0
+    fi
+
+    auto_start="$(plugin_setting codex-router auto_start)" || auto_start=""
+    [[ "$auto_start" == "false" ]] && return 0
+
+    # No service manager inside the container: run the supervisor directly
+    # and let it die with the container.
+    nohup model-router "$target" start --foreground >"${state_dir}/exitbox-router.log" 2>&1 &
+    disown 2>/dev/null || true
 }
 
 # ============================================================================
@@ -1850,6 +2050,7 @@ setup_git_credential_helper
 setup_ssh_proxy_tunnel
 start_host_port_relays
 setup_rtk
+setup_gpu
 trap 'cleanup_relay; cleanup_ide_relay; cleanup_host_port_relays' EXIT INT TERM
 
 if [[ "${1:-}" == "__agent-loop" ]]; then
@@ -1900,6 +2101,7 @@ if [[ -n "$AGENT" ]]; then
     inject_codex_approval_rules
     link_skills
     setup_graphify
+    setup_plugins
 fi
 
 # Debug: show what's available

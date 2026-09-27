@@ -25,11 +25,19 @@ import (
 	"github.com/cloud-exit/exitbox/internal/apk"
 	"github.com/cloud-exit/exitbox/internal/config"
 	"github.com/cloud-exit/exitbox/internal/env"
+	"github.com/cloud-exit/exitbox/internal/toolbox"
 )
 
 // listEnvProfileNames returns the env profile names for the given workspace.
 func listEnvProfileNames(workspace string) ([]string, error) {
 	return env.List(workspace)
+}
+
+// toolVersionsLoadedMsg carries a fetched version list for a tool dropdown.
+type toolVersionsLoadedMsg struct {
+	name     string
+	versions []string
+	err      error
 }
 
 // Step identifies the current wizard step.
@@ -42,9 +50,11 @@ const (
 	stepRole
 	stepLanguage
 	stepTools
+	stepToolVersions
 	stepPackages
 	stepProfile
 	stepAgents
+	stepPlugins
 	stepSettings
 	stepKeybindings
 	stepDomains
@@ -81,6 +91,13 @@ type State struct {
 	ExternalTools       []string          // selected external tools (e.g. "GitHub CLI")
 	FullGitSupport      bool              // full git support (SSH agent + .gitconfig)
 	RTK                 bool              // experimental: token-optimized CLI wrappers
+	AutoUpdateTools     bool              // auto-update unpinned tools to latest on save
+	AlpineVersion       string            // base image Alpine release (e.g. "3.21")
+	ToolVersions        map[string]string // per-tool version pins (empty value = default)
+	GPU                 bool              // experimental: expose host GPUs to this workspace
+	// Plugins holds the workspace's per-agent plugin configuration,
+	// keyed by agent name and then by plugin name.
+	Plugins map[string]map[string]config.PluginEntry
 }
 
 // Model is the root bubbletea model for the wizard.
@@ -98,6 +115,21 @@ type Model struct {
 	height           int
 	cancelled        bool
 	confirmed        bool
+
+	// Tool version step fields
+	toolVersions         map[string]string // working copy of per-tool versions
+	toolVersionCursor    int               // highlighted row (0 = Alpine base)
+	toolVersionEdit      bool              // true when typing a custom version
+	toolVersionInput     string            // custom version being typed
+	alpineVersion        string            // selected base image Alpine release
+	alpineDropdown       bool              // true when the Alpine dropdown is open
+	alpineDropdownCursor int               // highlighted Alpine release in dropdown
+	toolDropdownTool     string            // tool whose dropdown is open
+	toolDropdownOpen     bool              // true when a tool version dropdown is open
+	toolDropdownCursor   int               // highlighted option in the tool dropdown
+	toolDropdownVersions []string          // fetched real versions for the dropdown
+	toolDropdownLoading  bool              // true while fetching versions
+	toolDropdownErr      string            // fetch error message
 
 	// Package search step fields
 	pkgSearchInput string          // current search text
@@ -132,6 +164,10 @@ type Model struct {
 	kbEditInput string            // current text input for tmux notation
 	kbEditErr   string            // validation error message
 
+	// Plugins step
+	pluginCursor int         // highlighted plugin row
+	pluginForm   *PluginForm // open plugin configuration menu, nil when closed
+
 	// Vault step: 0=choice, 1=password, 2=confirm
 	vaultPhase     int
 	vaultPwInput   string // password being typed
@@ -152,10 +188,12 @@ var sidebarSteps = []stepInfo{
 	{stepRole, "Roles", 1},
 	{stepLanguage, "Languages", 2},
 	{stepTools, "Tools", 3},
-	{stepPackages, "Packages", 4},
+	{stepToolVersions, "Tool versions", 4},
+	{stepPackages, "Packages", 5},
 	{stepProfile, "Workspace", 5},
 	{stepCopyCredentials, "Credentials", 6},
 	{stepAgents, "Agents", 7},
+	{stepPlugins, "Plugins", 8},
 	{stepSettings, "Settings", 8},
 	{stepKeybindings, "Keybindings", 9},
 	{stepDomains, "Firewall", 10},
@@ -176,6 +214,9 @@ func (m Model) visibleSidebarSteps() []stepInfo {
 			continue
 		}
 		if si.Step == stepCopyCredentials && !m.hasCopyCredentialsStep() {
+			continue
+		}
+		if si.Step == stepPlugins && !m.hasPluginsStep() {
 			continue
 		}
 		// Vault is hidden in general-settings-only re-run.
@@ -214,11 +255,14 @@ func NewModel() Model {
 	checked["setting:pass_env"] = true
 	checked["setting:read_only"] = false
 	checked["setting:rtk"] = false
+	checked["setting:gpu"] = false
 	kb := config.DefaultKeybindings()
 	return Model{
 		step:             stepWelcome,
 		checked:          checked,
 		workspaceInput:   "default",
+		toolVersions:     make(map[string]string),
+		alpineVersion:    config.DefaultAlpineVersion,
 		pkgSelected:      make(map[string]bool),
 		pkgSearchMode:    true,
 		visitedSteps:     make(map[Step]bool),
@@ -307,6 +351,7 @@ func NewModelFromConfig(cfg *config.Config) Model {
 
 	// Settings
 	checked["setting:auto_update"] = cfg.Settings.AutoUpdate
+	checked["setting:auto_update_tools"] = cfg.Settings.AutoUpdateTools
 	checked["setting:status_bar"] = cfg.Settings.StatusBar
 	checked["setting:make_default"] = cfg.Settings.DefaultWorkspace == activeWorkspaceNameOrDefault(activeWorkspaceName)
 	checked["setting:firewall"] = !cfg.Settings.DefaultFlags.NoFirewall
@@ -364,14 +409,18 @@ func NewModelFromConfig(cfg *config.Config) Model {
 	}
 
 	// Pre-populate vault state from active workspace.
-	var vaultEnabled, vaultReadOnly bool
+	var vaultEnabled, vaultReadOnly, gpu bool
+	var workspacePlugins map[string]map[string]config.PluginEntry
 	for _, w := range cfg.Workspaces.Items {
 		if w.Name == activeWorkspaceName {
 			vaultEnabled = w.Vault.Enabled
 			vaultReadOnly = w.Vault.ReadOnly
+			gpu = w.GPU
+			workspacePlugins = copyPluginMap(w.Plugins)
 			break
 		}
 	}
+	checked["setting:gpu"] = gpu
 
 	m := Model{
 		step:             startStep,
@@ -381,6 +430,8 @@ func NewModelFromConfig(cfg *config.Config) Model {
 		workspaces:       workspaces,
 		defaultWorkspace: cfg.Settings.DefaultWorkspace,
 		pkgSelected:      pkgSelected,
+		toolVersions:     copyMap(cfg.Tools.Versions),
+		alpineVersion:    cfg.AlpineVersionOrDefault(),
 		pkgSearchMode:    true,
 		visitedSteps:     visited,
 		isFirstRun:       false,
@@ -393,6 +444,8 @@ func NewModelFromConfig(cfg *config.Config) Model {
 	}
 	m.state.VaultEnabled = vaultEnabled
 	m.state.VaultReadOnly = vaultReadOnly
+	m.state.GPU = gpu
+	m.state.Plugins = workspacePlugins
 	m.vaultExisting = vaultEnabled
 	return m
 }
@@ -441,6 +494,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 
+	case toolVersionsLoadedMsg:
+		if m.step == stepToolVersions && msg.name == m.toolDropdownTool {
+			m.toolDropdownLoading = false
+			if msg.err != nil {
+				m.toolDropdownErr = msg.err.Error()
+				m.toolDropdownVersions = nil
+			} else {
+				m.toolDropdownErr = ""
+				m.toolDropdownVersions = msg.versions
+			}
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
@@ -487,12 +553,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateLanguage(msg)
 	case stepTools:
 		return m.updateTools(msg)
+	case stepToolVersions:
+		return m.updateToolVersions(msg)
 	case stepPackages:
 		return m.updatePackages(msg)
 	case stepProfile:
 		return m.updateProfile(msg)
 	case stepAgents:
 		return m.updateAgents(msg)
+	case stepPlugins:
+		return m.updatePlugins(msg)
 	case stepSettings:
 		return m.updateSettings(msg)
 	case stepKeybindings:
@@ -527,6 +597,8 @@ func (m Model) View() string {
 		content = m.viewLanguage()
 	case stepTools:
 		content = m.viewTools()
+	case stepToolVersions:
+		content = m.viewToolVersions()
 	case stepPackages:
 		content = m.viewPackages()
 	case stepProfile:
@@ -762,6 +834,14 @@ func (m Model) updateWorkspaceSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state.VaultEnabled = ws.Vault.Enabled
 				m.state.VaultReadOnly = ws.Vault.ReadOnly
 				m.vaultExisting = ws.Vault.Enabled
+
+				// Per-workspace settings must follow the selection too, or the
+				// wizard shows another workspace's values and writes them back
+				// over this one on save.
+				m.state.GPU = ws.GPU
+				m.checked["setting:gpu"] = ws.GPU
+				m.state.Plugins = copyPluginMap(ws.Plugins)
+				m.pluginCursor = 0
 			} else {
 				// "Create new workspace" — start with a clean slate
 				m.workspaceInput = ""
@@ -797,6 +877,12 @@ func (m Model) updateWorkspaceSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state.VaultReadOnly = false
 				m.state.VaultPassword = ""
 				m.vaultExisting = false
+
+				// Per-workspace settings start fresh as well.
+				m.checked["setting:gpu"] = false
+				m.state.GPU = false
+				m.state.Plugins = nil
+				m.pluginCursor = 0
 			}
 			m.step = stepRole
 			m.cursor = 0
@@ -1092,7 +1178,7 @@ func (m Model) updateTools(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.visitedSteps[stepTools] = true
 			if m.workspaceOnly {
 				m.step = stepProfile
-			} else {
+			} else if len(m.relevantManagedTools()) == 0 {
 				m.step = stepPackages
 				m.pkgSearchMode = true
 				if m.pkgIndex == nil && !m.pkgLoading && m.pkgLoadErr == "" {
@@ -1100,6 +1186,11 @@ func (m Model) updateTools(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor = 0
 					return m, loadPkgIndex
 				}
+			} else {
+				m.step = stepToolVersions
+				m.toolVersionCursor = 0
+				m.toolVersionEdit = false
+				m.toolVersionInput = ""
 			}
 			m.cursor = 0
 		case "esc":
@@ -1173,6 +1264,360 @@ func (m Model) viewTools() string {
 
 	b.WriteString(helpStyle.Render("\nSpace to toggle, Enter to confirm, Esc to go back" + m.tabHint()))
 	return b.String()
+}
+
+// --- Tool Versions Step ---
+
+// relevantManagedTools returns the version-managed tools that apply to the
+// current language and external tool selections.
+func (m Model) relevantManagedTools() []toolbox.Tool {
+	// Use the live checkbox state so the list works even when this step is
+	// reached by jumping directly to it from the sidebar.
+	synced := m.collectAllStepState()
+	var profiles []string
+	if synced.state.OriginalDevelopment != nil {
+		profiles = applyLanguageDelta(synced.state.OriginalDevelopment, synced.state.Languages)
+	} else {
+		profiles = ComputeRoles(synced.state.Roles, synced.state.Languages)
+	}
+	roleSet := make(map[string]bool, len(profiles))
+	for _, p := range profiles {
+		roleSet[p] = true
+	}
+	extSet := make(map[string]bool, len(synced.state.ExternalTools))
+	for _, et := range synced.state.ExternalTools {
+		extSet[et] = true
+	}
+
+	var out []toolbox.Tool
+	for _, t := range toolbox.All {
+		if len(t.Roles) > 0 {
+			for _, r := range t.Roles {
+				if roleSet[r] {
+					out = append(out, t)
+					break
+				}
+			}
+			continue
+		}
+		if t.Name == "bun" && extSet["Bun"] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (m Model) updateToolVersions(msg tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+
+	tools := m.relevantManagedTools()
+	totalRows := 1 + len(tools)
+
+	// Alpine base image dropdown takes over all keys while open.
+	if m.alpineDropdown {
+		switch key.String() {
+		case "up", "k", "left", "h":
+			if m.alpineDropdownCursor > 0 {
+				m.alpineDropdownCursor--
+			}
+		case "down", "j", "right", "l":
+			if m.alpineDropdownCursor < len(toolbox.AlpineVersions)-1 {
+				m.alpineDropdownCursor++
+			}
+		case "enter":
+			m.alpineVersion = toolbox.AlpineVersions[m.alpineDropdownCursor]
+			m.alpineDropdown = false
+		case "esc":
+			m.alpineDropdown = false
+		}
+		return m, nil
+	}
+
+	// Tool version dropdown takes over all keys while open.
+	if m.toolDropdownOpen {
+		if !m.toolDropdownLoading {
+			t := toolbox.Get(m.toolDropdownTool)
+			if t != nil {
+				opts := toolDropdownOptions(m.toolVersions[t.Name], m.toolDropdownVersions)
+				if len(opts) > 0 {
+					switch key.String() {
+					case "up", "k":
+						if m.toolDropdownCursor > 0 {
+							m.toolDropdownCursor--
+						}
+					case "down", "j":
+						if m.toolDropdownCursor < len(opts)-1 {
+							m.toolDropdownCursor++
+						}
+					case "enter":
+						if m.toolDropdownCursor >= 0 && m.toolDropdownCursor < len(opts) {
+							chosen := opts[m.toolDropdownCursor]
+							if chosen == "default" {
+								m.toolVersions[t.Name] = ""
+							} else {
+								m.toolVersions[t.Name] = chosen
+							}
+						}
+						m.toolDropdownOpen = false
+						m.toolDropdownTool = ""
+					case "esc":
+						m.toolDropdownOpen = false
+						m.toolDropdownTool = ""
+					}
+				}
+			}
+		}
+		return m, nil
+	}
+
+	if m.toolVersionEdit && len(tools) > 0 {
+		return m.updateToolVersionInput(key, tools)
+	}
+
+	switch key.String() {
+	case "up", "k":
+		if m.toolVersionCursor > 0 {
+			m.toolVersionCursor--
+		}
+	case "down", "j":
+		if m.toolVersionCursor < totalRows-1 {
+			m.toolVersionCursor++
+		}
+	case "left", "h":
+		// Directly cycle the Alpine release when the base image row is focused.
+		if m.toolVersionCursor == 0 {
+			m.alpineVersion = cycleAlpineVersion(m.alpineVersion, -1)
+		}
+	case "right", "l":
+		if m.toolVersionCursor == 0 {
+			m.alpineVersion = cycleAlpineVersion(m.alpineVersion, +1)
+		}
+	case " ", "x":
+		if m.toolVersionCursor == 0 {
+			m.alpineDropdown = true
+			m.alpineDropdownCursor = alpineCursorFor(m.alpineVersion)
+			return m, nil
+		}
+		return m.openToolDropdown(tools[m.toolVersionCursor-1])
+	case "e":
+		if m.toolVersionCursor > 0 {
+			m.toolVersionEdit = true
+			m.toolVersionInput = m.toolVersions[tools[m.toolVersionCursor-1].Name]
+		}
+	case "enter":
+		m.visitedSteps[stepToolVersions] = true
+		m.step = stepPackages
+		m.pkgSearchMode = true
+		m.cursor = 0
+		if m.pkgIndex == nil && !m.pkgLoading && m.pkgLoadErr == "" {
+			m.pkgLoading = true
+			return m, loadPkgIndex
+		}
+	case "esc":
+		m.step = stepTools
+		m.cursor = 0
+	}
+	return m, nil
+}
+
+func (m Model) openToolDropdown(t toolbox.Tool) (Model, tea.Cmd) {
+	m.toolDropdownTool = t.Name
+	m.toolDropdownOpen = true
+	m.toolDropdownLoading = true
+	m.toolDropdownErr = ""
+	m.toolDropdownVersions = nil
+	m.toolDropdownCursor = toolDropdownCursorFor(m.toolVersions[t.Name], nil)
+	return m, func() tea.Msg {
+		versions, err := toolbox.AvailableVersions(&t)
+		return toolVersionsLoadedMsg{name: t.Name, versions: versions, err: err}
+	}
+}
+
+func toolDropdownOptions(current string, versions []string) []string {
+	opts := []string{"default", "latest"}
+	for _, v := range versions {
+		if v != "default" && v != "latest" {
+			opts = append(opts, v)
+		}
+	}
+	return opts
+}
+
+func toolDropdownCursorFor(current string, versions []string) int {
+	opts := toolDropdownOptions(current, versions)
+	for i, v := range opts {
+		if v == current || (current == "" && v == "default") {
+			return i
+		}
+	}
+	return 0
+}
+
+func cycleAlpineVersion(current string, delta int) string {
+	next := alpineCursorFor(current) + delta
+	n := len(toolbox.AlpineVersions)
+	if n == 0 {
+		return current
+	}
+	next = ((next % n) + n) % n
+	return toolbox.AlpineVersions[next]
+}
+
+func alpineCursorFor(version string) int {
+	for i, candidate := range toolbox.AlpineVersions {
+		if candidate == version {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m Model) updateToolVersionInput(key tea.KeyMsg, tools []toolbox.Tool) (tea.Model, tea.Cmd) {
+	row := m.toolVersionCursor - 1 // row 0 is the Alpine base image dropdown
+	if row < 0 || row >= len(tools) {
+		return m, nil
+	}
+	switch key.String() {
+	case "enter":
+		name := tools[row].Name
+		v := strings.TrimSpace(m.toolVersionInput)
+		if v == "" {
+			v = "default"
+		}
+		if t := toolbox.Get(name); t != nil {
+			if normalized, err := t.NormalizeVersion(v); err == nil {
+				v = normalized
+			}
+		}
+		if v == "default" {
+			m.toolVersions[name] = ""
+		} else {
+			m.toolVersions[name] = v
+		}
+		m.toolVersionEdit = false
+		m.toolVersionInput = ""
+	case "esc":
+		m.toolVersionEdit = false
+		m.toolVersionInput = ""
+	case "backspace", "ctrl+h":
+		if len(m.toolVersionInput) > 0 {
+			m.toolVersionInput = m.toolVersionInput[:len(m.toolVersionInput)-1]
+		}
+	default:
+		ch := key.String()
+		if len(ch) == 1 && isVersionChar(ch) {
+			m.toolVersionInput += ch
+		}
+	}
+	return m, nil
+}
+
+func isVersionChar(ch string) bool {
+	if ch >= "a" && ch <= "z" || ch >= "A" && ch <= "Z" {
+		return true
+	}
+	if ch >= "0" && ch <= "9" {
+		return true
+	}
+	switch ch {
+	case ".", "-", "_", "+":
+		return true
+	}
+	return false
+}
+
+func (m Model) viewToolVersions() string {
+	var b strings.Builder
+	b.WriteString(m.stepTitle(4, "Pin tool versions (optional)"))
+	b.WriteString("\n")
+	b.WriteString(subtitleStyle.Render("Choose a base image and per-tool versions. Enter opens a dropdown of real versions; Space cycles latest/default; 'e' types an exact version.\n"))
+	b.WriteString("\n")
+
+	// Alpine base image row.
+	cursor := "  "
+	if m.toolVersionCursor == 0 {
+		cursor = cursorStyle.Render("> ")
+	}
+	alpineLabel := fmt.Sprintf("%-16s", "Alpine base")
+	if m.toolVersionCursor == 0 {
+		alpineLabel = selectedStyle.Render(alpineLabel)
+	}
+	alpineValue := successStyle.Render(toolbox.AlpineVersionDisplay(m.alpineVersion))
+	alpineHint := dimStyle.Render("[dropdown]")
+	b.WriteString(fmt.Sprintf("%s%s %s %s\n", cursor, alpineLabel, alpineValue, alpineHint))
+	if m.alpineDropdown {
+		b.WriteString("  ")
+		for i, version := range toolbox.AlpineVersions {
+			label := fmt.Sprintf(" %s ", version)
+			if i == m.alpineDropdownCursor {
+				label = selectedStyle.Render(label)
+			}
+			b.WriteString(label)
+		}
+		b.WriteString("\n")
+	}
+
+	tools := m.relevantManagedTools()
+	for i, t := range tools {
+		row := i + 1
+		cursor := "  "
+		if m.toolVersionCursor == row {
+			cursor = cursorStyle.Render("> ")
+		}
+		paddedName := fmt.Sprintf("%-16s", t.Display)
+		if m.toolVersionCursor == row {
+			paddedName = selectedStyle.Render(paddedName)
+		}
+		value := formatToolVersion(t, m.toolVersions[t.Name])
+		desc := dimStyle.Render(t.Description)
+		b.WriteString(fmt.Sprintf("%s%s %s %s\n", cursor, paddedName, value, desc))
+		if m.toolDropdownOpen && m.toolDropdownTool == t.Name {
+			if m.toolDropdownLoading {
+				b.WriteString(dimStyle.Render("  \u27f3 Loading versions...\n"))
+			} else if m.toolDropdownErr != "" {
+				b.WriteString(warnStyle.Render("  \u26a0 " + m.toolDropdownErr + "\n"))
+			} else {
+				opts := toolDropdownOptions(m.toolVersions[t.Name], m.toolDropdownVersions)
+				b.WriteString("  ")
+				for j, opt := range opts {
+					label := fmt.Sprintf(" %s ", opt)
+					if j == m.toolDropdownCursor {
+						label = selectedStyle.Render(label)
+					}
+					b.WriteString(label)
+				}
+				b.WriteString("\n")
+			}
+		}
+	}
+
+	if len(tools) == 0 && !m.alpineDropdown {
+		b.WriteString(dimStyle.Render("  No version-managed tools match your selection.\n"))
+	}
+
+	if m.toolVersionEdit && len(tools) > 0 {
+		row := m.toolVersionCursor - 1
+		if row >= 0 && row < len(tools) {
+			t := tools[row]
+			b.WriteString(fmt.Sprintf("\n  Version for %s: %s%s\n", t.Display, m.toolVersionInput, cursorStyle.Render("▌")))
+		}
+	}
+
+	b.WriteString(helpStyle.Render("\nSpace: dropdown with real versions, Enter: continue, e: exact version, Esc: back" + m.tabHint()))
+	return b.String()
+}
+
+func formatToolVersion(t toolbox.Tool, value string) string {
+	if value == "" {
+		return dimStyle.Render("default")
+	}
+	if value == "latest" {
+		return successStyle.Render("latest")
+	}
+	return warnStyle.Render(value)
 }
 
 // --- Packages Step (search + browse) ---
@@ -1987,8 +2432,9 @@ func (m Model) updateAgents(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.visitedSteps[stepAgents] = true
-			m.step = stepSettings
+			m.step = m.stepAfterAgents()
 			m.cursor = 0
+			m.pluginCursor = 0
 		case "esc":
 			if m.hasCopyCredentialsStep() {
 				m.step = stepCopyCredentials
@@ -2045,6 +2491,7 @@ var settingsOptions = []struct {
 	Description string
 }{
 	{"setting:auto_update", "Auto-update agents", "Check for new versions on every launch (slows down startup)"},
+	{"setting:auto_update_tools", "Auto-update tools to latest", "Track newest versions for unpinned tools (Go, Node, Bun, ...)"},
 	{"setting:status_bar", "Status bar", "Show a status bar with version and agent info during sessions"},
 	{"setting:firewall", "Network firewall", "Restrict outbound network to allowlisted domains only (disabling decreases security)"},
 	{"setting:auto_resume", "Auto-resume sessions", "Automatically resume the last agent conversation"},
@@ -2052,6 +2499,25 @@ var settingsOptions = []struct {
 	{"setting:read_only", "Read-only workspace", "Mount workspace as read-only (agents cannot modify files)"},
 	{"setting:full_git", "Full Git support", "Mount SSH agent + .gitconfig into container (exposes git identity)"},
 	{"setting:rtk", "RTK token optimizer", "Experimental: use rtk to reduce CLI output tokens by 60-90%"},
+	{"setting:gpu", "GPU passthrough", "Experimental: expose host GPUs to this workspace (builds it on an Ubuntu CUDA image; needs the NVIDIA Container Toolkit)"},
+}
+
+// applySettingChecks copies the settings step's checkboxes into wizard
+// state. Every path that leaves the step (Enter, a sidebar jump, the Review
+// snapshot) goes through here, so a setting cannot be saved on one path and
+// silently dropped on another.
+func (m *Model) applySettingChecks() {
+	m.state.AutoUpdate = m.checked["setting:auto_update"]
+	m.state.AutoUpdateTools = m.checked["setting:auto_update_tools"]
+	m.state.StatusBar = m.checked["setting:status_bar"]
+	m.state.EnableFirewall = m.checked["setting:firewall"]
+	m.state.AutoResume = m.checked["setting:auto_resume"]
+	m.state.PassEnv = m.checked["setting:pass_env"]
+	m.state.ReadOnly = m.checked["setting:read_only"]
+	m.state.MakeDefault = m.checked["setting:make_default"]
+	m.state.FullGitSupport = m.checked["setting:full_git"]
+	m.state.RTK = m.checked["setting:rtk"]
+	m.state.GPU = m.checked["setting:gpu"]
 }
 
 func (m Model) updateSettings(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -2068,16 +2534,9 @@ func (m Model) updateSettings(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case " ", "x":
 			k := settingsOptions[m.cursor].Key
 			m.checked[k] = !m.checked[k]
+			m.applySettingChecks()
 		case "enter":
-			m.state.AutoUpdate = m.checked["setting:auto_update"]
-			m.state.StatusBar = m.checked["setting:status_bar"]
-			m.state.EnableFirewall = m.checked["setting:firewall"]
-			m.state.AutoResume = m.checked["setting:auto_resume"]
-			m.state.PassEnv = m.checked["setting:pass_env"]
-			m.state.ReadOnly = m.checked["setting:read_only"]
-			m.state.MakeDefault = m.checked["setting:make_default"]
-			m.state.FullGitSupport = m.checked["setting:full_git"]
-			m.state.RTK = m.checked["setting:rtk"]
+			m.applySettingChecks()
 			m.visitedSteps[stepSettings] = true
 			if !m.isFirstRun && m.topMenuChoice == 0 {
 				// Workspace management: Settings → Domains or Vault
@@ -2098,7 +2557,11 @@ func (m Model) updateSettings(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 			}
 		case "esc":
-			m.step = stepAgents
+			if m.hasPluginsStep() {
+				m.step = stepPlugins
+			} else {
+				m.step = stepAgents
+			}
 			m.cursor = 0
 		}
 	}
@@ -2610,11 +3073,16 @@ func (m Model) viewReview() string {
 	if !m.state.AutoUpdate {
 		autoUpdateStr = dimStyle.Render("no")
 	}
+	autoUpdateToolsStr := successStyle.Render("yes")
+	if !m.state.AutoUpdateTools {
+		autoUpdateToolsStr = dimStyle.Render("no")
+	}
 	statusBarStr := successStyle.Render("yes")
 	if !m.state.StatusBar {
 		statusBarStr = dimStyle.Render("no")
 	}
 	b.WriteString(fmt.Sprintf("  Auto-update:  %s\n", autoUpdateStr))
+	b.WriteString(fmt.Sprintf("  Auto-upd tools:%s\n", autoUpdateToolsStr))
 	b.WriteString(fmt.Sprintf("  Status bar:   %s\n", statusBarStr))
 	defaultStr := dimStyle.Render("no")
 	if m.state.MakeDefault {
@@ -2655,6 +3123,21 @@ func (m Model) viewReview() string {
 		gitStr = warnStyle.Render("⚠ yes")
 	}
 	b.WriteString(fmt.Sprintf("  Full Git:     %s\n", gitStr))
+	rtkStr := dimStyle.Render("no")
+	if m.state.RTK {
+		rtkStr = successStyle.Render("yes")
+	}
+	b.WriteString(fmt.Sprintf("  RTK:          %s\n", rtkStr))
+	gpuStr := dimStyle.Render("no")
+	if m.state.GPU {
+		gpuStr = successStyle.Render("yes (Ubuntu CUDA image)")
+	}
+	b.WriteString(fmt.Sprintf("  GPU:          %s\n", gpuStr))
+	if summary := m.pluginsSummary(); summary != "" {
+		b.WriteString(fmt.Sprintf("  Plugins:      %s\n", selectedStyle.Render(summary)))
+	} else {
+		b.WriteString(fmt.Sprintf("  Plugins:      %s\n", dimStyle.Render("none")))
+	}
 
 	if len(m.state.ExternalTools) > 0 {
 		b.WriteString(fmt.Sprintf("  Ext. tools:   %s\n", selectedStyle.Render(strings.Join(m.state.ExternalTools, ", "))))
@@ -2687,6 +3170,22 @@ func (m Model) viewReview() string {
 		wrapped := wrapWords(sorted, "              ", m.contentWidth())
 		firstLine := strings.TrimLeft(wrapped, " ")
 		b.WriteString(fmt.Sprintf("  Extra pkgs: %s\n", selectedStyle.Render(firstLine)))
+	}
+
+	if len(m.state.ToolVersions) > 0 {
+		parts := make([]string, 0, len(m.state.ToolVersions))
+		for name, version := range m.state.ToolVersions {
+			if version == "" || version == "default" {
+				continue
+			}
+			parts = append(parts, name+"="+version)
+		}
+		if len(parts) > 0 {
+			sortStrings(parts)
+			wrapped := wrapWords(parts, "                    ", m.contentWidth())
+			firstLine := strings.TrimLeft(wrapped, " ")
+			b.WriteString(fmt.Sprintf("  Tool versions: %s\n", selectedStyle.Render(firstLine)))
+		}
 	}
 
 	if len(m.state.DomainCategories) > 0 {
@@ -2821,8 +3320,16 @@ func (m Model) contentWidth() int {
 // stepTitle formats a step title like "Step 3/9 — Some title".
 // It adjusts the total count when firewall is disabled (8 instead of 9).
 func (m Model) stepTitle(num int, title string) string {
-	total := len(m.visibleSidebarSteps())
-	return titleStyle.Render(fmt.Sprintf("Step %d/%d — %s", num, total, title))
+	visible := m.visibleSidebarSteps()
+	total := len(visible)
+	actual := num
+	for i, si := range visible {
+		if si.Step == m.step {
+			actual = i + 1
+			break
+		}
+	}
+	return titleStyle.Render(fmt.Sprintf("Step %d/%d — %s", actual, total, title))
 }
 
 // tabHint returns ", Tab: sidebar" if the sidebar is available.
@@ -2908,7 +3415,7 @@ func (m Model) updateSidebar(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m = m.collectCurrentStepState()
 		m.visitedSteps[m.step] = true
-		if target == stepReview {
+		if target == stepReview || target == stepToolVersions {
 			m = m.collectAllStepState()
 		}
 		m.step = target
@@ -2970,14 +3477,8 @@ func (m Model) collectAllStepState() Model {
 			m.state.Agents = append(m.state.Agents, a.Name)
 		}
 	}
-	m.state.AutoUpdate = m.checked["setting:auto_update"]
-	m.state.StatusBar = m.checked["setting:status_bar"]
-	m.state.EnableFirewall = m.checked["setting:firewall"]
-	m.state.AutoResume = m.checked["setting:auto_resume"]
-	m.state.PassEnv = m.checked["setting:pass_env"]
-	m.state.ReadOnly = m.checked["setting:read_only"]
-	m.state.MakeDefault = m.checked["setting:make_default"]
-	m.state.FullGitSupport = m.checked["setting:full_git"]
+	m.applySettingChecks()
+	m.state.AlpineVersion = strings.TrimSpace(m.alpineVersion)
 	m.state.DomainCategories = m.domainCategories
 	m.state.Keybindings = copyMap(m.keybindings)
 	m.state.ExternalTools = nil
@@ -2986,6 +3487,7 @@ func (m Model) collectAllStepState() Model {
 			m.state.ExternalTools = append(m.state.ExternalTools, et.Name)
 		}
 	}
+	m.state.ToolVersions = copyMap(m.toolVersions)
 	return m
 }
 
@@ -3030,6 +3532,9 @@ func (m Model) collectCurrentStepState() Model {
 				m.state.ExternalTools = append(m.state.ExternalTools, et.Name)
 			}
 		}
+	case stepToolVersions:
+		m.state.AlpineVersion = strings.TrimSpace(m.alpineVersion)
+		m.state.ToolVersions = copyMap(m.toolVersions)
 	case stepPackages:
 		m.state.CustomPackages = nil
 		for pkg := range m.pkgSelected {
@@ -3047,14 +3552,7 @@ func (m Model) collectCurrentStepState() Model {
 			}
 		}
 	case stepSettings:
-		m.state.AutoUpdate = m.checked["setting:auto_update"]
-		m.state.StatusBar = m.checked["setting:status_bar"]
-		m.state.EnableFirewall = m.checked["setting:firewall"]
-		m.state.AutoResume = m.checked["setting:auto_resume"]
-		m.state.PassEnv = m.checked["setting:pass_env"]
-		m.state.ReadOnly = m.checked["setting:read_only"]
-		m.state.MakeDefault = m.checked["setting:make_default"]
-		m.state.FullGitSupport = m.checked["setting:full_git"]
+		m.applySettingChecks()
 	case stepKeybindings:
 		m.state.Keybindings = copyMap(m.keybindings)
 	case stepDomains:

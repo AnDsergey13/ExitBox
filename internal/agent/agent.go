@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cloud-exit/exitbox/internal/config"
 	"github.com/cloud-exit/exitbox/internal/container"
@@ -39,6 +40,71 @@ type PrepareBuildInput struct {
 	Download       func(ctx context.Context, url, dest string) error
 	FileSHA256     func(path string) string
 	Logf           func(format string, args ...interface{})
+
+	// BaseImage is the image this agent layer builds on. Empty means the
+	// default Alpine base image.
+	BaseImage string
+	// Libc is the C library the image's binaries must target, "musl"
+	// (Alpine) or "gnu" (the glibc GPU flavor). Empty means musl.
+	Libc string
+	// Install renders a package install step for the image's distribution.
+	// Nil falls back to Alpine's apk.
+	Install func(pkgs []string) string
+	// Remove renders the matching uninstall step for build-only packages.
+	// Nil falls back to Alpine's apk.
+	Remove func(pkgs []string) string
+	// InstallInline renders a package install command without the RUN
+	// prefix, for agents that chain it into a longer step. Nil falls back
+	// to Alpine's apk.
+	InstallInline func(pkgs []string) string
+}
+
+// Base returns the image the agent layer builds on.
+func (in PrepareBuildInput) Base() string {
+	if in.BaseImage == "" {
+		return "exitbox-base"
+	}
+	return in.BaseImage
+}
+
+// IsMusl reports whether the image is musl based, which decides both the
+// release artifacts an agent downloads and whether musl-only workarounds
+// apply.
+func (in PrepareBuildInput) IsMusl() bool {
+	return in.Libc == "" || in.Libc == "musl"
+}
+
+// LibcTag returns the token upstream projects use in release artifact names.
+func (in PrepareBuildInput) LibcTag() string {
+	if in.IsMusl() {
+		return "musl"
+	}
+	return in.Libc
+}
+
+// InstallStep renders a package install step for the image's distribution.
+func (in PrepareBuildInput) InstallStep(pkgs ...string) string {
+	if in.Install != nil {
+		return in.Install(pkgs)
+	}
+	return "RUN apk add --no-cache " + strings.Join(pkgs, " ")
+}
+
+// InlineInstall renders a package install command without the RUN prefix.
+func (in PrepareBuildInput) InlineInstall(pkgs ...string) string {
+	if in.InstallInline != nil {
+		return in.InstallInline(pkgs)
+	}
+	return "apk add --no-cache " + strings.Join(pkgs, " ")
+}
+
+// RemoveStep renders the uninstall step for build-only packages, without a
+// RUN prefix so it can be chained into an existing step.
+func (in PrepareBuildInput) RemoveStep(pkgs ...string) string {
+	if in.Remove != nil {
+		return in.Remove(pkgs)
+	}
+	return "apk del " + strings.Join(pkgs, " ")
 }
 
 type Agent interface {

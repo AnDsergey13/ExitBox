@@ -30,7 +30,9 @@ import (
 
 	"github.com/cloud-exit/exitbox/internal/config"
 	"github.com/cloud-exit/exitbox/internal/container"
+	"github.com/cloud-exit/exitbox/internal/distro"
 	"github.com/cloud-exit/exitbox/internal/platform"
+	"github.com/cloud-exit/exitbox/internal/toolbox"
 	"github.com/cloud-exit/exitbox/internal/ui"
 	"github.com/cloud-exit/exitbox/static"
 )
@@ -180,17 +182,60 @@ func isReleaseVersion(v string) bool {
 	return strings.HasPrefix(v, "v")
 }
 
-// BuildBase builds the exitbox-base image.
-func BuildBase(ctx context.Context, rt container.Runtime, force bool) error {
-	imageName := "exitbox-base"
+// BaseImageName returns the base image name for an image flavor.
+func BaseImageName(d *distro.Distro) string {
+	return "exitbox-base" + d.ImageSuffix()
+}
+
+// BuildBase builds the exitbox-base image for an image flavor.
+func BuildBase(ctx context.Context, rt container.Runtime, force bool, d *distro.Distro) error {
+	imageName := BaseImageName(d)
 	cmd := container.Cmd(rt)
+	cfg := config.LoadOrDefault()
+	alpine := validAlpineVersion(cfg.AlpineVersionOrDefault())
+
+	// The GPU flavor has no published image and no Alpine release to track:
+	// it is always built locally from the CUDA base.
+	if !d.IsDefault() {
+		if !force && !ForceRebuild && rt.ImageExists(imageName) {
+			v, _ := rt.ImageInspect(imageName, `{{index .Config.Labels "exitbox.version"}}`)
+			if v == Version {
+				return nil
+			}
+			ui.Infof("%s base image version mismatch (%s != %s). Rebuilding...", d.DisplayName, v, Version)
+		}
+		if err := buildBaseFull(ctx, rt, cmd, imageName, d); err != nil {
+			ui.Warnf("The %s base image is %s.", d.DisplayName, d.BaseImageRef())
+			ui.Warnf("Choose another CUDA release with %s=docker.io/nvidia/cuda:<tag> when your", distro.GPUBaseImageEnv)
+			ui.Warn("driver is older than this one needs, then rebuild.")
+			return err
+		}
+		return nil
+	}
 
 	if !force && !ForceRebuild && rt.ImageExists(imageName) {
 		v, _ := rt.ImageInspect(imageName, `{{index .Config.Labels "exitbox.version"}}`)
-		if v == Version {
+		a, _ := rt.ImageInspect(imageName, `{{index .Config.Labels "exitbox.alpine"}}`)
+		// Older images predate the Alpine label; treat them as the default
+		// release so they don't rebuild every run.
+		if a == "" {
+			a = config.DefaultAlpineVersion
+		}
+		if v == Version && a == alpine {
 			return nil
 		}
-		ui.Infof("Base image version mismatch (%s != %s). Rebuilding...", v, Version)
+		if a != alpine {
+			ui.Infof("Base image Alpine mismatch (%s != %s). Rebuilding...", a, "alpine:"+alpine)
+		} else {
+			ui.Infof("Base image version mismatch (%s != %s). Rebuilding...", v, Version)
+		}
+	}
+
+	// Release binaries normally reuse the published base image. A custom
+	// Alpine release cannot be pulled from the registry, so build locally.
+	if isReleaseVersion(Version) && alpine != config.DefaultAlpineVersion {
+		ui.Infof("Custom Alpine base image (%s), building locally...", "alpine:"+alpine)
+		return buildBaseFull(ctx, rt, cmd, imageName, d)
 	}
 
 	// For release versions, try pulling the pre-built base image from GHCR
@@ -198,7 +243,7 @@ func BuildBase(ctx context.Context, rt container.Runtime, force bool) error {
 	if isReleaseVersion(Version) {
 		remoteRef := BaseImageRegistry + ":" + Version
 		if err := pullImage(rt, remoteRef, "Pulling base image..."); err == nil {
-			if err := buildLocalIntermediary(ctx, rt, cmd, remoteRef, imageName); err == nil {
+			if err := buildLocalIntermediary(ctx, rt, cmd, remoteRef, imageName, d); err == nil {
 				ui.Success("Base image ready (from registry)")
 				return nil
 			}
@@ -209,19 +254,58 @@ func BuildBase(ctx context.Context, rt container.Runtime, force bool) error {
 	}
 
 	// Full local build (dev versions or when pull/intermediary fails).
-	return buildBaseFull(ctx, rt, cmd, imageName)
+	return buildBaseFull(ctx, rt, cmd, imageName, d)
+}
+
+// templateBaseDockerfile renders the embedded base Dockerfile with the
+// configured Alpine release and records it in a label for rebuild detection.
+func templateBaseDockerfile(cfg *config.Config, d *distro.Distro) []byte {
+	if !d.IsDefault() {
+		// Podman cannot resolve short image names, so the FROM line carries
+		// the registry host; an override swaps the whole reference.
+		df := strings.ReplaceAll(string(static.DockerfileBaseGPU),
+			"FROM "+distro.CUDABaseImage, "FROM "+d.BaseImageRef())
+		df += fmt.Sprintf("\nLABEL exitbox.base.image=\"%s\"\n", d.BaseImageRef())
+		return []byte(df)
+	}
+	version := validAlpineVersion(cfg.AlpineVersionOrDefault())
+	// The registry host is explicit: Podman resolves no short names without
+	// a containers-registries.conf.
+	from := "FROM docker.io/library/alpine:" + config.DefaultAlpineVersion
+	df := strings.ReplaceAll(string(static.DockerfileBase), from, "FROM docker.io/library/alpine:"+version)
+	df += fmt.Sprintf("\nLABEL exitbox.alpine=\"%s\"\n", version)
+	return []byte(df)
+}
+
+// localIntermediaryDockerfile returns the thin layer that creates the
+// runtime user, which differs between BusyBox and Debian user tools.
+func localIntermediaryDockerfile(d *distro.Distro) []byte {
+	if d.IsDefault() {
+		return static.DockerfileLocal
+	}
+	return static.DockerfileLocalGPU
+}
+
+// validAlpineVersion returns version when it is a real Alpine release,
+// otherwise falls back to the default and warns.
+func validAlpineVersion(version string) string {
+	if toolbox.IsValidAlpineVersion(version) {
+		return version
+	}
+	ui.Warnf("Unknown Alpine version %q, using %s", version, config.DefaultAlpineVersion)
+	return config.DefaultAlpineVersion
 }
 
 // buildLocalIntermediary builds the thin local layer (user creation + exitbox-allow)
 // on top of the pulled base image.
-func buildLocalIntermediary(ctx context.Context, rt container.Runtime, cmd, baseRef, imageName string) error {
+func buildLocalIntermediary(ctx context.Context, rt container.Runtime, cmd, baseRef, imageName string, d *distro.Distro) error {
 	buildCtx := filepath.Join(config.Cache, "build-local")
 	if err := os.MkdirAll(buildCtx, 0755); err != nil {
 		return fmt.Errorf("failed to create build context dir: %w", err)
 	}
 
 	dockerfilePath := filepath.Join(buildCtx, "Dockerfile")
-	if err := os.WriteFile(dockerfilePath, static.DockerfileLocal, 0644); err != nil {
+	if err := os.WriteFile(dockerfilePath, localIntermediaryDockerfile(d), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile.local: %w", err)
 	}
 
@@ -264,18 +348,20 @@ func buildLocalIntermediary(ctx context.Context, rt container.Runtime, cmd, base
 // buildBaseFull performs a full local build of the base image from scratch.
 // It first builds the published base image locally, then layers the local
 // intermediary (user creation + exitbox-allow) on top.
-func buildBaseFull(ctx context.Context, rt container.Runtime, cmd, imageName string) error {
-	ui.Infof("Building base image locally with %s...", cmd)
+func buildBaseFull(ctx context.Context, rt container.Runtime, cmd, imageName string, d *distro.Distro) error {
+	ui.Infof("Building %s base image locally with %s...", d.DisplayName, cmd)
 
 	// Step 1: Build the published base image locally.
-	publishedName := "exitbox-base-published"
+	publishedName := "exitbox-base" + d.ImageSuffix() + "-published"
 	buildCtx := filepath.Join(config.Cache, "build")
 	if err := os.MkdirAll(buildCtx, 0755); err != nil {
 		return fmt.Errorf("failed to create build context dir: %w", err)
 	}
 
+	cfg := config.LoadOrDefault()
+
 	dockerfilePath := filepath.Join(buildCtx, "Dockerfile")
-	if err := os.WriteFile(dockerfilePath, static.DockerfileBase, 0644); err != nil {
+	if err := os.WriteFile(dockerfilePath, templateBaseDockerfile(cfg, d), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(buildCtx, "docker-entrypoint"), static.DockerEntrypoint, 0755); err != nil {
@@ -284,8 +370,6 @@ func buildBaseFull(ctx context.Context, rt container.Runtime, cmd, imageName str
 	if err := os.WriteFile(filepath.Join(buildCtx, ".dockerignore"), static.Dockerignore, 0644); err != nil {
 		return fmt.Errorf("failed to write .dockerignore: %w", err)
 	}
-
-	cfg := config.LoadOrDefault()
 
 	args := buildArgs(cmd)
 	args = append(args,
@@ -301,7 +385,7 @@ func buildBaseFull(ctx context.Context, rt container.Runtime, cmd, imageName str
 	}
 
 	// Step 2: Build the local intermediary on top.
-	if err := buildLocalIntermediary(ctx, rt, cmd, publishedName, imageName); err != nil {
+	if err := buildLocalIntermediary(ctx, rt, cmd, publishedName, imageName, d); err != nil {
 		return fmt.Errorf("failed to build local intermediary: %w", err)
 	}
 
@@ -510,8 +594,8 @@ func formatDuration(d time.Duration) string {
 var cacheExportDrivers = map[string]bool{
 	"docker-container": true,
 	"kubernetes":       true,
-	"remote":            true,
-	"cloud":             true,
+	"remote":           true,
+	"cloud":            true,
 }
 
 var (

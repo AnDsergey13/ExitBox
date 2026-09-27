@@ -299,7 +299,7 @@ func runAgent(agentName string, passthrough []string) {
 			ui.Errorf("Failed to build images: %v", err)
 		}
 
-		workspaceHash := image.WorkspaceHash(cfg, projectDir, flags.Workspace)
+		workspaceHash := image.WorkspaceHash(cfg, agentName, projectDir, flags.Workspace)
 
 		opts := run.Options{
 			Agent:             agentName,

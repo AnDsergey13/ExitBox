@@ -256,6 +256,83 @@ Compatible agents: **Claude, Codex, OpenCode, Copilot, Pi**. (Cursor's graphify 
 
 > **Note:** Graphify is experimental. Selecting/deselecting it rebuilds the tools image layer (`exitbox run <agent> --update`).
 
+### Agent Plugins
+
+Plugins extend an agent inside its ExitBox image. They are enabled **per workspace**, installed into a dedicated plugins image layer, and configured through a menu whose settings are applied when the container starts.
+
+The first plugin is [codex-router](https://github.com/duolahypercho/codex-router): a local model router that lets **Codex**, **Claude Code**, and **Cursor** talk to Anthropic, DeepSeek, Kimi, Grok, OpenRouter, and other providers through one gateway running inside the container.
+
+```bash
+exitbox plugins list                       # Every plugin, per agent, with status
+exitbox plugins codex list                 # Plugins available for Codex
+exitbox plugins enable codex codex-router  # Enable it for the active workspace
+exitbox plugins edit codex codex-router    # Open its configuration menu
+exitbox plugins codex show codex-router    # Print the stored configuration
+```
+
+The same commands work agent-first (`exitbox plugins codex edit codex-router`), and `-w/--workspace` targets a workspace other than the active one. Plugins also have their own step in `exitbox setup`.
+
+**Provider keys stay in the vault.** A secret setting stores only a vault key reference (`vault:MY_KEY`), never the secret itself:
+
+```bash
+exitbox plugins set codex codex-router anthropic_api_key CODEX_ROUTER_ANTHROPIC_KEY
+exitbox vault set CODEX_ROUTER_ANTHROPIC_KEY <your-api-key>
+```
+
+At container start the entrypoint resolves the reference through the vault, exports it as the variable the router expects, publishes the routes to the agent, and starts the router service. The provider API hosts a plugin needs are added to the firewall allowlist for that session automatically.
+
+Enabling or disabling a plugin, or pinning a different version, changes the image: apply it with `exitbox rebuild <agent>` or the next `exitbox run <agent>`. Editing settings does not rebuild anything.
+
+### GPU Support (Experimental)
+
+A workspace can ask for the host's GPUs. Workspaces with `gpu: true` build on a
+different image flavor: an Ubuntu CUDA base instead of Alpine, because the driver
+userspace the NVIDIA container toolkit injects, and every CUDA wheel, are built
+against glibc and cannot load on musl.
+
+```bash
+exitbox gpu enable          # for the active workspace
+exitbox gpu enable ml       # or a named one
+exitbox gpu status          # what the host can actually provide
+exitbox gpu disable
+```
+
+The setup wizard carries the same flag under **Workspace management → Settings → GPU passthrough**, and the review step lists it before saving.
+
+or in `config.yaml`:
+
+```yaml
+workspaces:
+  items:
+    - name: ml
+      gpu: true
+```
+
+**What has to be true on the host.** `exitbox gpu status` reports which of these is missing:
+
+1. the NVIDIA kernel driver, so `/dev/nvidia*` exists and `nvidia-smi` runs;
+2. the NVIDIA Container Toolkit, which injects the driver userspace into the container: `sudo nvidia-ctk runtime configure --runtime=docker` for Docker, `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml` for Podman;
+3. a workspace with `gpu: true`.
+
+ExitBox then runs Docker with `--gpus all`, or Podman with the CDI device `nvidia.com/gpu=all`, and always sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` (override with `EXITBOX_GPU_CAPABILITIES` on the host). Without the `compute` capability the toolkit injects `nvidia-smi` and no CUDA libraries at all. If the host cannot provide a GPU, the run continues without one and says exactly what is missing rather than failing later; the container start-up reports what actually arrived.
+
+**What the GPU flavor changes.** The image chain is the same, built from the CUDA base:
+
+| | default | GPU workspace |
+|---|---|---|
+| base image | `docker.io/library/alpine:<version>` | `docker.io/nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04` |
+| package manager | `apk` | `apt-get` |
+| C library | musl | glibc |
+| image names | `exitbox-<agent>-*` | `exitbox-<agent>-*-gpu` |
+
+The CUDA release has to match the host driver (12.6 needs 560+). Point ExitBox at another one with `EXITBOX_GPU_BASE_IMAGE=docker.io/nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04` and rebuild. Image references are fully qualified because Podman resolves no short names without a `containers-registries.conf`.
+
+Ubuntu 24.04 ships tmux 3.4, which predates the `extended-keys-format` option, so on the GPU flavor ExitBox leaves that option out (the config would error on every session start) and modified keys use tmux's xterm encoding. Kitty-protocol agents that need `Shift+Enter` there still work with `exitbox run <agent> --no-tmux`.
+
+Package names stay Alpine names everywhere (roles, tool categories, workspace packages); the flavor translates them (`postgresql16-client` becomes `postgresql-client-16`, `bind-tools` becomes `dnsutils`, and so on). Tools with no Ubuntu package (kubectl, helm, kustomize, k9s, opentofu) are installed from their official binaries instead, and anything else that has no equivalent is reported during the build rather than silently dropped.
+
+> **Note:** GPU passthrough is experimental and off by default. It widens the container's access to host hardware, and the CUDA image is considerably larger than the Alpine one.
+
 ### Agent Skills
 
 Skills are reusable SKILL.md files that give agents specialized capabilities (coding conventions, deploy workflows, review checklists, etc.). ExitBox provides a universal skill installer that works across all agents. Skills are installed once per workspace and automatically linked into each agent's skill directory at container start.
@@ -487,6 +564,18 @@ exitbox run --update claude    # rebuild with latest agent version
 exitbox rebuild all            # rebuild all enabled agents
 ```
 
+To update the tools and languages installed inside the images (Go, Node.js, Bun, etc.):
+
+```bash
+exitbox tools update                  # every managed tool/language to latest
+exitbox tools update go               # Go to latest
+exitbox tools update go 1.35.0        # pin Go to a specific version
+exitbox tools update go@1.35.0 node@22 # pin several at once
+exitbox tools list                    # show current tool versions
+```
+
+`exitbox tools update` saves the versions to `config.yaml` without rebuilding anything. Add `--rebuild` to rebuild the tools and project images for every enabled agent, or let the next `exitbox run` pick up the change. Use `exitbox tools update go default` to remove a pin and go back to the built-in install.
+
 ## Commands
 
 ### Setup
@@ -516,6 +605,8 @@ exitbox enable <agent>    # Enable an agent
 exitbox disable <agent>   # Disable an agent
 exitbox rebuild <agent>   # Force rebuild of agent image
 exitbox rebuild all       # Rebuild all enabled agents
+exitbox tools list        # List managed tools and versions
+exitbox tools update      # Update tools/languages to latest or a pinned version
 exitbox uninstall <agent> # Remove agent images and config
 exitbox update            # Update ExitBox to the latest version
 exitbox aliases           # Print shell aliases for ~/.bashrc
@@ -538,6 +629,25 @@ exitbox env show <profile>         # Show env profile (values redacted)
 exitbox env delete <profile>       # Delete env profile
 exitbox env default [profile]      # Get or set the default env profile
 exitbox env default --clear        # Remove the default env profile
+```
+
+### Plugin Management
+
+```bash
+exitbox plugins list                          # All plugins grouped by agent
+exitbox plugins list codex                    # Plugins for one agent
+exitbox plugins codex list                    # Same, agent-first
+exitbox plugins enable codex codex-router     # Enable for the active workspace
+exitbox plugins disable codex codex-router    # Disable
+exitbox plugins edit codex codex-router       # Configuration menu
+exitbox plugins show codex codex-router       # Stored configuration
+exitbox plugins set codex codex-router port 4300      # Set one setting
+exitbox plugins set codex codex-router port           # Clear it (back to default)
+exitbox plugins enable codex codex-router -w work     # Target another workspace
+
+# Project-scoped marketplace plugins (Codex)
+exitbox plugins install codex https://github.com/org/plugin-repo
+exitbox plugins remove codex plugin-name
 ```
 
 ### Config Generation
@@ -789,7 +899,7 @@ The recommended way to configure ExitBox is through the setup wizard:
 exitbox setup
 ```
 
-The wizard generates `config.yaml` and `allowlist.yaml` tailored to your developer role. It walks you through up to 10 steps: roles, languages, tools, packages, workspace name, credentials, agents, settings, firewall (domain allowlist), and review. Some steps are shown conditionally (e.g., credentials only when other workspaces exist). Re-run it at any time to reconfigure.
+The wizard generates `config.yaml` and `allowlist.yaml` tailored to your developer role. It walks you through roles, languages, tools, per-tool versions, packages, workspace name, credentials, agents, settings, firewall (domain allowlist), and review. The settings step includes an **Auto-update tools to latest** option that sets unpinned managed tools to `latest`, and the tool-versions step lets you pin Go, Node.js, Bun, etc. individually. Some steps are shown conditionally (e.g., credentials only when other workspaces exist). Re-run it at any time to reconfigure.
 
 ### config.yaml
 
@@ -814,6 +924,14 @@ workspaces:
         - python
       vault:
         enabled: true
+      gpu: false              # experimental GPU passthrough for this workspace
+      plugins:                # per-agent plugins, enabled per workspace
+        codex:
+          codex-router:
+            enabled: true
+            settings:
+              providers: anthropic-api,deepseek
+              anthropic_api_key: vault:CODEX_ROUTER_ANTHROPIC_KEY
 
 agents:
   claude:
@@ -828,9 +946,14 @@ tools:
   user:
     - postgresql-client
     - redis
+  versions:                # per-tool version pins ("latest" = track newest)
+    go: "1.35.0"
+    node: latest
 
 settings:
   auto_update: false
+  auto_update_tools: false    # Set true to track latest for unpinned managed tools
+  alpine_version: "3.21"      # Base image Alpine release (dropdown in setup)
   status_bar: true            # Show "ExitBox <version> - <agent>" bar at top of terminal
   default_workspace: default  # Workspace used when no directory match is found
   default_flags:
@@ -890,6 +1013,60 @@ Add extra Alpine packages to your container images:
 
 The image rebuilds automatically when tools change.
 
+### Versioned Tools and Languages
+
+ExitBox can pin or track versions for the following managed tools and
+languages:
+
+| Tool | Type | Install | Versioning |
+|------|------|---------|------------|
+| `alpine` | base image | Official Alpine image | Real Alpine releases only, e.g. `3.21` (dropdown in setup) |
+|:-----|:-----|:--------|:-----------|
+| `go` | language | Official tarball (checksum verified) | Exact Go release, e.g. `1.35.0` |
+| `golangci-lint` | tool | GitHub release | Exact release, e.g. `1.64.8` |
+| `bun` | tool | npm | Exact version, e.g. `1.2.3` |
+| `node` | language | Alpine apk | Alpine package version, e.g. `22.14.0-r0` |
+| `python` | language | Alpine apk | Alpine package version, e.g. `3.12.9-r0` |
+| `rust` | language | Alpine apk | Alpine package version |
+| `java` | language | Alpine apk | Alpine package version |
+| `dotnet` | language | Alpine apk | Alpine package version |
+| `ruby` | language | Alpine apk | Alpine package version |
+| `php` | language | Alpine apk | Alpine package version |
+
+`latest` tracks the newest version at image build time. For apk-managed
+languages a concrete version is resolved against the Alpine package index
+before saving, so you can ask for a prefix such as `node 22` and ExitBox
+pins the newest matching package (e.g. `nodejs=22.14.0-r0`). The special
+value `default` removes a pin and restores the built-in install.
+
+Versions only take effect where the tool is installed: a language must be
+part of at least one workspace's `development` list, and `bun` must be
+selected as an external tool. Tool version changes are included in the image
+cache hashes, so images rebuild automatically on the next `exitbox run`.
+
+```bash
+exitbox tools update go            # go -> latest
+exitbox tools update go 1.35.0     # go -> 1.35.0 (checksum verified)
+exitbox tools update node 22       # newest Alpine nodejs matching "22"
+exitbox tools update python default # back to the built-in Python
+exitbox tools update alpine 3.24     # switch the base image to a real Alpine release
+exitbox setup                        # or set per-tool versions in the setup wizard
+```
+
+Per-tool versions and the auto-update-to-latest setting can also be managed
+from the setup wizard: the tool-versions step appears after Tools when your
+roles/languages make a managed tool relevant, and the Settings step has an
+"Auto-update tools to latest" toggle that applies `latest` to every unpinned
+managed tool. The same step includes an **Alpine base** dropdown limited to real
+releases available on the official Alpine mirror, and every managed tool
+row has a dropdown loaded from its real upstream source: Go from go.dev,
+golangci-lint from GitHub releases, Bun from the npm registry, and
+Alpine-package languages from the APK index of the selected Alpine release.
+Each dropdown starts with `default` and `latest`, followed by the published
+versions (newest first). The Alpine selection is stored as
+`settings.alpine_version` and is used for the base and squid image `FROM`
+lines, apk package resolution, and image cache hashes.
+
 ### Resource Limits
 
 ExitBox enforces default resource limits to prevent runaway agents:
@@ -935,22 +1112,29 @@ When Codex is enabled, ExitBox publishes callback port `1455` on the shared `exi
 
 ### Alpine Base Image
 
-All agent images are built on **Alpine Linux**. The base package list is embedded in the binary and shared by all image builds.
+Agent images are built on **Alpine Linux** by default. The base package list is embedded in the binary and shared by all image builds.
 
 Alpine was chosen for:
 - **Small image size**: ~5 MB base vs ~80 MB for Debian slim
 - **musl libc**: Matches the native binaries shipped by Claude Code, git-delta, and yq
-- **Consistent package manager**: `apk` is used everywhere — base image, profiles, and user tools
+- **Consistent package manager**: `apk` is used everywhere: base image, profiles, and user tools
 
-### 3-Layer Image Hierarchy
+The one exception is a workspace with `gpu: true`, which builds the same chain on an Ubuntu CUDA base instead. See [GPU Support](#gpu-support-experimental); package names stay Alpine names and are translated per flavor.
+
+### Image Layer Hierarchy
 
 ```
-base image (Alpine + tools)
+base image (Alpine, or Ubuntu CUDA for GPU workspaces)
   └── core image (agent-specific install)
-        └── project image (development profiles layered on)
+        └── tools image (global tools and external tools)
+              └── plugins image (enabled agent plugins, skipped when none)
+                    └── project image (development profiles layered on)
 ```
 
-Each layer uses label-based caching (`exitbox.version`, `exitbox.agent.version`, `exitbox.tools.hash`, `exitbox.profiles.hash`) so rebuilds are fast and incremental.
+Each flavor has its own chain: a GPU workspace builds `exitbox-<agent>-core-gpu`,
+`-tools-gpu` and so on, so the two never share a layer.
+
+Each layer uses label-based caching (`exitbox.version`, `exitbox.agent.version`, `exitbox.tools.hash`, `exitbox.plugins.hash`, `exitbox.profiles.hash`) so rebuilds are fast and incremental. A workspace with no plugins enabled builds no plugins layer at all: the project image is built straight on the tools image.
 
 ### Supply-Chain Hardened Agent Installs
 
@@ -958,6 +1142,7 @@ Agent binaries are installed via **direct download with SHA-256 checksum verific
 
 - **Claude Code**: binary download verified against Anthropic's signed manifest. Download URL auto-discovered from the official installer if the hardcoded endpoint changes.
 - **OpenCode**: GitHub release tarball verified against the `digest` field from the GitHub Releases API.
+- **Codex**: the official release *package* (`codex-package-<target>.tar.gz`), checksummed on the host and bind mounted into the build so the archive never becomes an image layer. Codex resolves `bin/codex`, `codex-package.json`, `codex-path/rg` and `codex-resources/bwrap` from the running executable; installed as a bare binary its app-server daemon refuses to start. Releases older than that asset fall back to the individual binaries. The package's voice resources are left out of the image.
 
 No `curl | bash` for any agent. Builds abort on any checksum mismatch.
 

@@ -23,6 +23,7 @@ import (
 
 	"github.com/cloud-exit/exitbox/internal/agents"
 	"github.com/cloud-exit/exitbox/internal/agents/jstools"
+	"github.com/cloud-exit/exitbox/internal/distro"
 )
 
 // Role represents a developer role preset (Frontend, Backend, etc.) that
@@ -330,18 +331,45 @@ func ComputeExternalToolPackages(names []string) []string {
 // ComputeExternalToolInstallSteps returns additional Dockerfile snippets
 // required by selected external tools.
 func ComputeExternalToolInstallSteps(names []string) []string {
+	return ComputeExternalToolInstallStepsFor(names, nil)
+}
+
+// ComputeExternalToolInstallStepsFor returns additional Dockerfile snippets
+// required by selected external tools, applying tool version pins.
+func ComputeExternalToolInstallStepsFor(names []string, versions map[string]string) []string {
+	return ComputeExternalToolInstallStepsForDistro(names, versions, distro.Default())
+}
+
+// ComputeExternalToolInstallStepsForDistro returns the same snippets for a
+// specific image flavor, so tools that ship per-libc builds install the
+// right one.
+func ComputeExternalToolInstallStepsForDistro(names []string, versions map[string]string, d *distro.Distro) []string {
+	if d == nil {
+		d = distro.Default()
+	}
 	seen := make(map[string]bool)
 	var result []string
 
 	for _, name := range names {
 		for _, et := range AllExternalTools {
-			if et.Name == name {
-				if et.InstallStep != "" && !seen[et.InstallStep] {
-					seen[et.InstallStep] = true
-					result = append(result, et.InstallStep)
-				}
-				break
+			if et.Name != name {
+				continue
 			}
+			step := et.InstallStep
+			if et.Name == "Bun" {
+				version := ""
+				switch v := versions["bun"]; v {
+				case "", "latest", "default":
+				default:
+					version = v
+				}
+				step = jstools.InstallBunFor(version, d.LibcTag()) + "\n"
+			}
+			if step != "" && !seen[step] {
+				seen[step] = true
+				result = append(result, step)
+			}
+			break
 		}
 	}
 

@@ -78,6 +78,7 @@ CAPTURE_FUNC="$(extract_func capture_resume_token)"
 BUILD_FUNC="$(extract_func build_resume_args)"
 DISPLAY_FUNC="$(extract_func agent_display_name)"
 TMUX_CONF_FUNC="$(extract_func write_tmux_conf)"
+TMUX_EXTKEYS_FUNC="$(extract_func tmux_supports_extended_keys_format)"
 LINK_PATH_FUNC="$(extract_func link_path)"
 DEFAULT_SESSION_NAME_FUNC="$(extract_func default_session_name)"
 CURRENT_SESSION_NAME_FUNC="$(extract_func current_session_name)"
@@ -735,7 +736,9 @@ test_write_tmux_conf_scroll_settings() {
         eval "$PARSE_KB_FUNC"
         parse_keybindings
         eval "$DISPLAY_FUNC"
+        eval "$TMUX_EXTKEYS_FUNC"
         eval "$TMUX_CONF_FUNC"
+        tmux() { [[ "$1" == "-V" ]] && echo "tmux 3.5a"; }
         conf_path="$(write_tmux_conf)"
         cat "$conf_path"
     )" 2>/dev/null
@@ -777,6 +780,61 @@ test_write_tmux_conf_default_terminal() {
         cat "$(write_tmux_conf)"
     )" 2>/dev/null
     assert_contains "default-terminal falls back to xterm-256color" "$without_tmux" 'set -g default-terminal "xterm-256color"'
+}
+
+# ============================================================================
+# Test: extended-keys-format is gated on the tmux version
+# ============================================================================
+test_write_tmux_conf_extended_keys_format() {
+    # tmux 3.5 added extended-keys-format. Emitting it on an older tmux
+    # (Ubuntu 24.04 ships 3.4, so the GPU image does too) makes every session
+    # start with "invalid option".
+    local modern legacy
+    modern="$(
+        AGENT="pi"; EXITBOX_WORKSPACE_NAME="default"; EXITBOX_VERSION="test"
+        unset EXITBOX_KEYBINDINGS
+        eval "$PARSE_KB_FUNC"; parse_keybindings
+        eval "$DISPLAY_FUNC"; eval "$TMUX_EXTKEYS_FUNC"; eval "$TMUX_CONF_FUNC"
+        infocmp() { return 0; }
+        tmux() { [[ "$1" == "-V" ]] && echo "tmux 3.5a"; }
+        cat "$(write_tmux_conf)"
+    )" 2>/dev/null
+    assert_contains "tmux 3.5 keeps csi-u encoding" "$modern" "set -g extended-keys-format csi-u"
+    assert_contains "extended keys stay on" "$modern" "set -g extended-keys on"
+
+    legacy="$(
+        AGENT="pi"; EXITBOX_WORKSPACE_NAME="default"; EXITBOX_VERSION="test"
+        unset EXITBOX_KEYBINDINGS
+        eval "$PARSE_KB_FUNC"; parse_keybindings
+        eval "$DISPLAY_FUNC"; eval "$TMUX_EXTKEYS_FUNC"; eval "$TMUX_CONF_FUNC"
+        infocmp() { return 0; }
+        tmux() { [[ "$1" == "-V" ]] && echo "tmux 3.4"; }
+        cat "$(write_tmux_conf)"
+    )" 2>/dev/null
+    if [[ "$legacy" == *"set -g extended-keys-format"* ]]; then
+        ((FAIL++))
+        ERRORS+=("FAIL: tmux 3.4 must not get extended-keys-format")
+    else
+        ((PASS++))
+    fi
+    assert_contains "tmux 3.4 still forwards extended keys" "$legacy" "set -g extended-keys on"
+}
+
+test_tmux_supports_extended_keys_format_versions() {
+    local out
+    out="$(
+        eval "$TMUX_EXTKEYS_FUNC"
+        for v in "tmux 3.5a" "tmux 3.6" "tmux 4.0" "tmux 3.4" "tmux 3.2a" "tmux next-3.6" "bogus"; do
+            tmux() { [[ "$1" == "-V" ]] && echo "$v"; }
+            if tmux_supports_extended_keys_format; then echo "$v yes"; else echo "$v no"; fi
+        done
+    )"
+    assert_contains "3.5a supported" "$out" "tmux 3.5a yes"
+    assert_contains "3.6 supported" "$out" "tmux 3.6 yes"
+    assert_contains "4.0 supported" "$out" "tmux 4.0 yes"
+    assert_contains "3.4 unsupported" "$out" "tmux 3.4 no"
+    assert_contains "3.2a unsupported" "$out" "tmux 3.2a no"
+    assert_contains "unparsable version is unsupported" "$out" "bogus no"
 }
 
 # ============================================================================
@@ -882,6 +940,8 @@ test_parse_keybindings_default
 test_parse_keybindings_custom
 test_parse_keybindings_partial
 test_write_tmux_conf_dynamic_keybindings
+test_write_tmux_conf_extended_keys_format
+test_tmux_supports_extended_keys_format_versions
 
 # ============================================================================
 # Vault sandbox instructions
@@ -1868,6 +1928,290 @@ test_setup_graphify() {
 }
 
 test_setup_graphify
+
+# ============================================================================
+# GPU
+# ============================================================================
+echo ""
+echo "Testing GPU diagnostics..."
+
+SETUP_GPU_FUNC="$(extract_func setup_gpu)"
+GPU_HINT_FUNC="$(extract_func gpu_userspace_hint)"
+
+test_setup_gpu_noop_when_disabled() {
+    local out
+    out="$(
+        unset EXITBOX_GPU
+        eval "$SETUP_GPU_FUNC"
+        setup_gpu
+        echo DONE
+    )" 2>&1
+    assert_eq "setup_gpu does nothing when GPU is off" "DONE" "$out"
+}
+
+test_setup_gpu_reports_missing_devices() {
+    local out
+    out="$(
+        export EXITBOX_GPU="true"
+        eval "$SETUP_GPU_FUNC"
+        # The test machine may itself have NVIDIA device nodes, so the probes
+        # are stubbed: this asserts the diagnosis, not the host.
+        ls() { return 1; }
+        setup_gpu 2>&1
+    )"
+    assert_contains "setup_gpu names the missing device nodes" "$out" "no /dev/nvidia* device node is visible"
+    assert_contains "setup_gpu points at the host check" "$out" "exitbox gpu status"
+}
+
+test_setup_gpu_reports_missing_cuda() {
+    local out fakedev
+    # /dev is not writable in the test environment, so drive the device probe
+    # through a stub `ls` that reports a device node.
+    out="$(
+        export EXITBOX_GPU="true"
+        eval "$SETUP_GPU_FUNC"
+        eval "$GPU_HINT_FUNC"
+        ls() { if [[ "$*" == *"/dev/nvidia"* ]]; then echo "/dev/nvidia0"; return 0; fi; command ls "$@"; }
+        find() { return 0; }
+        nvidia-smi() { return 1; }
+        setup_gpu 2>&1
+    )"
+    assert_contains "setup_gpu reports a missing CUDA driver library" "$out" "no CUDA driver library was injected"
+    assert_contains "setup_gpu names the capability that injects it" "$out" "NVIDIA_DRIVER_CAPABILITIES=compute"
+    assert_contains "setup_gpu explains why nvidia-smi failed" "$out" "nvidia-smi did not run"
+}
+
+test_gpu_userspace_hint_per_flavor() {
+    local musl glibc marker
+    marker="$TEST_TMPDIR/alpine-release"
+    : > "$marker"
+    musl="$(eval "$GPU_HINT_FUNC"; gpu_userspace_hint "$marker")"
+    glibc="$(eval "$GPU_HINT_FUNC"; gpu_userspace_hint "$TEST_TMPDIR/not-alpine")"
+
+    assert_contains "gpu hint names the musl limit on Alpine" "$musl" "Alpine/musl"
+    assert_contains "gpu hint points at the CUDA image on Alpine" "$musl" "CUDA image"
+    assert_contains "gpu hint blames the host on the CUDA flavor" "$glibc" "exitbox gpu status"
+}
+
+test_setup_gpu_noop_when_disabled
+test_setup_gpu_reports_missing_devices
+test_setup_gpu_reports_missing_cuda
+test_gpu_userspace_hint_per_flavor
+
+# ============================================================================
+# Plugins
+# ============================================================================
+echo ""
+echo "Testing plugin setup..."
+
+PLUGIN_ENV_VAR_FUNC="$(extract_func plugin_env_var)"
+PLUGIN_SETTING_FUNC="$(extract_func plugin_setting)"
+SETUP_PLUGINS_FUNC="$(extract_func setup_plugins)"
+SETUP_CODEX_ROUTER_FUNC="$(extract_func setup_codex_router)"
+CODEX_ROUTER_PROVIDER_ENV_FUNC="$(extract_func codex_router_provider_env)"
+CODEX_ROUTER_STATE_DIR_FUNC="$(extract_func codex_router_state_dir)"
+
+test_plugin_env_var_naming() {
+    local out
+    out="$(
+        eval "$PLUGIN_ENV_VAR_FUNC"
+        plugin_env_var codex-router providers
+    )"
+    assert_eq "plugin_env_var uppercases and replaces dashes" \
+        "EXITBOX_PLUGIN_CODEX_ROUTER_PROVIDERS" "$out"
+
+    # A provider id with a dash must land on the same variable ExitBox
+    # generates on the host for that provider's key setting.
+    out="$(
+        eval "$PLUGIN_ENV_VAR_FUNC"
+        plugin_env_var codex-router anthropic-api_key
+    )"
+    assert_eq "plugin_env_var maps a provider key setting" \
+        "EXITBOX_PLUGIN_CODEX_ROUTER_ANTHROPIC_API_KEY" "$out"
+}
+
+test_plugin_setting_plain_value() {
+    local out
+    out="$(
+        export EXITBOX_PLUGIN_CODEX_ROUTER_PROVIDERS="anthropic-api,deepseek"
+        eval "$PLUGIN_ENV_VAR_FUNC"; eval "$PLUGIN_SETTING_FUNC"
+        plugin_setting codex-router providers
+    )"
+    assert_eq "plugin_setting returns a plain value" "anthropic-api,deepseek" "$out"
+}
+
+test_plugin_setting_unset_value() {
+    local out
+    out="$(
+        unset EXITBOX_PLUGIN_CODEX_ROUTER_PORT
+        eval "$PLUGIN_ENV_VAR_FUNC"; eval "$PLUGIN_SETTING_FUNC"
+        plugin_setting codex-router port
+    )"
+    assert_eq "plugin_setting returns empty for an unset setting" "" "$out"
+}
+
+test_plugin_setting_resolves_vault_reference() {
+    local out
+    out="$(
+        export PATH="$TEST_TMPDIR/bin:$PATH"
+        mkdir -p "$TEST_TMPDIR/bin"
+        {
+            echo '#!/usr/bin/env bash'
+            echo '[[ "$1" == "get" ]] || exit 1'
+            echo 'echo "secret-for-$2"'
+        } > "$TEST_TMPDIR/bin/exitbox-vault"
+        chmod +x "$TEST_TMPDIR/bin/exitbox-vault"
+        export EXITBOX_PLUGIN_CODEX_ROUTER_ANTHROPIC_API_KEY="vault:MY_KEY"
+        eval "$PLUGIN_ENV_VAR_FUNC"; eval "$PLUGIN_SETTING_FUNC"
+        plugin_setting codex-router anthropic-api_key
+    )"
+    assert_eq "plugin_setting resolves a vault reference" "secret-for-MY_KEY" "$out"
+}
+
+test_setup_plugins_noop_without_env() {
+    local out
+    out="$(
+        unset EXITBOX_PLUGINS
+        eval "$SETUP_PLUGINS_FUNC"
+        setup_codex_router() { echo "CALLED"; }
+        setup_plugins
+        echo DONE
+    )" 2>&1
+    assert_eq "setup_plugins does nothing without EXITBOX_PLUGINS" "DONE" "$out"
+}
+
+test_setup_plugins_dispatches_known_plugin() {
+    local out
+    out="$(
+        export EXITBOX_PLUGINS="codex-router"
+        eval "$SETUP_PLUGINS_FUNC"
+        setup_codex_router() { echo "ROUTER"; }
+        setup_plugins
+    )" 2>&1
+    assert_eq "setup_plugins dispatches codex-router" "ROUTER" "$out"
+}
+
+test_setup_plugins_warns_on_unknown_plugin() {
+    local out
+    out="$(
+        export EXITBOX_PLUGINS="not-a-plugin"
+        eval "$SETUP_PLUGINS_FUNC"
+        setup_codex_router() { echo "ROUTER"; }
+        setup_plugins 2>&1
+    )"
+    assert_contains "setup_plugins warns about an unknown plugin" "$out" "not-a-plugin"
+}
+
+test_setup_codex_router_requires_installed_binary() {
+    local out
+    out="$(
+        export EXITBOX_PLUGINS="codex-router"
+        export AGENT="codex"
+        export PATH="/nonexistent-dir"
+        eval "$PLUGIN_ENV_VAR_FUNC"; eval "$PLUGIN_SETTING_FUNC"; eval "$CODEX_ROUTER_STATE_DIR_FUNC"
+        eval "$SETUP_CODEX_ROUTER_FUNC"
+        setup_codex_router 2>&1
+    )"
+    assert_contains "setup_codex_router reports a missing install" "$out" "not installed in this image"
+}
+
+test_setup_codex_router_skips_unsupported_agent() {
+    local out
+    out="$(
+        export AGENT="qwen"
+        export PATH="$TEST_TMPDIR/bin2:$PATH"
+        mkdir -p "$TEST_TMPDIR/bin2"
+        {
+            echo '#!/usr/bin/env bash'
+            echo 'echo ROUTER "$@"'
+        } > "$TEST_TMPDIR/bin2/model-router"
+        chmod +x "$TEST_TMPDIR/bin2/model-router"
+        eval "$PLUGIN_ENV_VAR_FUNC"; eval "$PLUGIN_SETTING_FUNC"; eval "$CODEX_ROUTER_STATE_DIR_FUNC"
+        eval "$SETUP_CODEX_ROUTER_FUNC"
+        setup_codex_router
+        echo DONE
+    )" 2>&1
+    assert_eq "setup_codex_router leaves unsupported agents alone" "DONE" "$out"
+}
+
+test_setup_codex_router_configures_and_starts() {
+    local home log out
+    home="$(mktemp -d "$TEST_TMPDIR/router.XXXXXX")"
+    log="$TEST_TMPDIR/router-calls.log"
+    : > "$log"
+    out="$(
+        export HOME="$home"
+        export AGENT="codex"
+        export MODEL_ROUTER_LOG="$log"
+        export PATH="$TEST_TMPDIR/bin3:$PATH"
+        mkdir -p "$TEST_TMPDIR/bin3"
+        {
+            echo '#!/usr/bin/env bash'
+            echo 'echo "$@" >> "$MODEL_ROUTER_LOG"'
+            echo 'exit 0'
+        } > "$TEST_TMPDIR/bin3/model-router"
+        chmod +x "$TEST_TMPDIR/bin3/model-router"
+        export EXITBOX_PLUGIN_CODEX_ROUTER_PROVIDERS="deepseek"
+        export EXITBOX_PLUGIN_CODEX_ROUTER_AUTO_START="false"
+        eval "$PLUGIN_ENV_VAR_FUNC"; eval "$PLUGIN_SETTING_FUNC"
+        eval "$CODEX_ROUTER_PROVIDER_ENV_FUNC"; eval "$CODEX_ROUTER_STATE_DIR_FUNC"
+        eval "$SETUP_CODEX_ROUTER_FUNC"
+        setup_codex_router
+        echo "STATE=$CODEX_ROUTER_STATE_DIR"
+    )" 2>&1
+
+    assert_contains "setup_codex_router persists state in the agent config dir" "$out" "$home/.codex/codex-router"
+    assert_contains "setup_codex_router runs the headless setup" "$(cat "$log")" "setup --no-tray --providers deepseek"
+    assert_file_content "setup_codex_router records the configured providers" \
+        "$home/.codex/codex-router/.exitbox-providers" "deepseek"
+    if grep -q "start --foreground" "$log"; then
+        ((FAIL++))
+        ERRORS+=("FAIL: setup_codex_router started the router although auto_start was false")
+    else
+        ((PASS++))
+    fi
+}
+
+test_setup_codex_router_without_providers() {
+    local home out
+    home="$(mktemp -d "$TEST_TMPDIR/router2.XXXXXX")"
+    out="$(
+        export HOME="$home"
+        export AGENT="codex"
+        export PATH="$TEST_TMPDIR/bin3:$PATH"
+        export MODEL_ROUTER_LOG="$TEST_TMPDIR/router-calls2.log"
+        unset EXITBOX_PLUGIN_CODEX_ROUTER_PROVIDERS
+        eval "$PLUGIN_ENV_VAR_FUNC"; eval "$PLUGIN_SETTING_FUNC"
+        eval "$CODEX_ROUTER_PROVIDER_ENV_FUNC"; eval "$CODEX_ROUTER_STATE_DIR_FUNC"
+        eval "$SETUP_CODEX_ROUTER_FUNC"
+        setup_codex_router 2>&1
+    )"
+    assert_contains "setup_codex_router asks for providers when none are configured" "$out" "no providers configured"
+}
+
+test_codex_router_state_dir_per_agent() {
+    local out
+    out="$(
+        export HOME="/home/user"
+        eval "$CODEX_ROUTER_STATE_DIR_FUNC"
+        printf '%s %s %s' "$(codex_router_state_dir codex)" "$(codex_router_state_dir claude)" "$(codex_router_state_dir cursor)"
+    )"
+    assert_eq "codex_router_state_dir keeps state in each agent's mounted config dir" \
+        "/home/user/.codex/codex-router /home/user/.claude/codex-router /home/user/.cursor/codex-router" "$out"
+}
+
+test_codex_router_state_dir_per_agent
+test_plugin_env_var_naming
+test_plugin_setting_plain_value
+test_plugin_setting_unset_value
+test_plugin_setting_resolves_vault_reference
+test_setup_plugins_noop_without_env
+test_setup_plugins_dispatches_known_plugin
+test_setup_plugins_warns_on_unknown_plugin
+test_setup_codex_router_requires_installed_binary
+test_setup_codex_router_skips_unsupported_agent
+test_setup_codex_router_configures_and_starts
+test_setup_codex_router_without_providers
 
 # ============================================================================
 # Results

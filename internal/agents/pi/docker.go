@@ -28,26 +28,32 @@ import (
 const piNPMPackage = "@earendil-works/pi-coding-agent"
 
 func (p *Pi) GetDockerfileInstall(buildCtx string) (string, error) {
+	return p.installSnippet(agent.PrepareBuildInput{}), nil
+}
+
+// installSnippet renders the install step for the image flavor being built.
+func (p *Pi) installSnippet(in agent.PrepareBuildInput) string {
 	return `# Install Node.js and the Pi Coding Agent via npm
 ARG PI_VERSION
-RUN apk add --no-cache nodejs npm && \
+` + in.InstallStep("nodejs", "npm") + ` && \
     npm install -g --ignore-scripts ` + piNPMPackage + `@${PI_VERSION} && \
     pi --version
-LABEL exitbox.agent.version="${PI_VERSION}"`, nil
+LABEL exitbox.agent.version="${PI_VERSION}"`
 }
 
 func (p *Pi) GetFullDockerfile(version string) (string, error) {
-	install, err := p.GetDockerfileInstall("")
-	if err != nil {
-		return "", err
-	}
-	df := "FROM exitbox-base\n\n"
+	return p.fullDockerfile(agent.PrepareBuildInput{Version: version}), nil
+}
+
+func (p *Pi) fullDockerfile(in agent.PrepareBuildInput) string {
+	version := in.Version
 	if version == "" {
 		version = "latest"
 	}
+	df := "FROM " + in.Base() + "\n\n"
 	df += fmt.Sprintf("ARG PI_VERSION=%s\n", version)
-	df += install
-	return df, nil
+	df += p.installSnippet(in)
+	return df
 }
 
 func (p *Pi) PrepareBuild(in agent.PrepareBuildInput) error {
@@ -62,10 +68,8 @@ func (p *Pi) PrepareBuild(in agent.PrepareBuildInput) error {
 	if in.Logf != nil {
 		in.Logf("Building Pi Coding Agent image with version %s (npm install at build time)", version)
 	}
-	df, err := p.GetFullDockerfile(version)
-	if err != nil {
-		return err
-	}
+	in.Version = version
+	df := p.fullDockerfile(in)
 	if err := os.WriteFile(in.DockerfilePath, []byte(df), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile: %w", err)
 	}

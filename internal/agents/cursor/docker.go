@@ -32,10 +32,15 @@ import (
 // installs the latest published cursor-agent, so CURSOR_VERSION is informational
 // (recorded as the image label) rather than a pin.
 func (c *Cursor) GetDockerfileInstall(buildCtx string) (string, error) {
+	return c.installSnippet(agent.PrepareBuildInput{}), nil
+}
+
+// installSnippet renders the install step for the image flavor being built.
+func (c *Cursor) installSnippet(in agent.PrepareBuildInput) string {
 	return `# Install the Cursor CLI (cursor-agent) via the official install script.
 ARG CURSOR_VERSION
 RUN set -e && \
-    apk add --no-cache curl bash && \
+    ` + in.InlineInstall("curl", "bash") + ` && \
     mkdir -p /opt/cursor && \
     export HOME=/opt/cursor && \
     curl -fsSL https://cursor.com/install | bash && \
@@ -45,21 +50,22 @@ RUN set -e && \
     ln -sf "$AGENT_BIN" /usr/local/bin/cursor && \
     chmod -R a+rX /opt/cursor && \
     cursor-agent --version
-LABEL exitbox.agent.version="${CURSOR_VERSION}"`, nil
+LABEL exitbox.agent.version="${CURSOR_VERSION}"`
 }
 
 func (c *Cursor) GetFullDockerfile(version string) (string, error) {
-	install, err := c.GetDockerfileInstall("")
-	if err != nil {
-		return "", err
-	}
-	df := "FROM exitbox-base\n\n"
+	return c.fullDockerfile(agent.PrepareBuildInput{Version: version}), nil
+}
+
+func (c *Cursor) fullDockerfile(in agent.PrepareBuildInput) string {
+	version := in.Version
 	if version == "" {
 		version = "latest"
 	}
+	df := "FROM " + in.Base() + "\n\n"
 	df += fmt.Sprintf("ARG CURSOR_VERSION=%s\n", version)
-	df += install
-	return df, nil
+	df += c.installSnippet(in)
+	return df
 }
 
 func (c *Cursor) PrepareBuild(in agent.PrepareBuildInput) error {
@@ -74,10 +80,8 @@ func (c *Cursor) PrepareBuild(in agent.PrepareBuildInput) error {
 	if in.Logf != nil {
 		in.Logf("Building Cursor CLI image (version %s, official install script at build time)", version)
 	}
-	df, err := c.GetFullDockerfile(version)
-	if err != nil {
-		return err
-	}
+	in.Version = version
+	df := c.fullDockerfile(in)
 	if err := os.WriteFile(in.DockerfilePath, []byte(df), 0644); err != nil {
 		return fmt.Errorf("failed to write Dockerfile: %w", err)
 	}

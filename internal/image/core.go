@@ -30,13 +30,19 @@ import (
 	"github.com/cloud-exit/exitbox/internal/agents"
 	"github.com/cloud-exit/exitbox/internal/config"
 	"github.com/cloud-exit/exitbox/internal/container"
+	"github.com/cloud-exit/exitbox/internal/distro"
 	"github.com/cloud-exit/exitbox/internal/ui"
 )
 
+// CoreImageName returns the agent core image name for an image flavor.
+func CoreImageName(agentName string, d *distro.Distro) string {
+	return fmt.Sprintf("exitbox-%s-core%s", agentName, d.ImageSuffix())
+}
+
 // BuildCore builds the agent core image (exitbox-<agent>-core).
 // If agentVersion is provided, it pins to that specific version instead of fetching latest.
-func BuildCore(ctx context.Context, rt container.Runtime, agentName string, force bool, agentVersion string) error {
-	imageName := fmt.Sprintf("exitbox-%s-core", agentName)
+func BuildCore(ctx context.Context, rt container.Runtime, agentName string, force bool, agentVersion string, d *distro.Distro) error {
+	imageName := CoreImageName(agentName, d)
 	cmd := container.Cmd(rt)
 
 	a := agents.Get(agentName)
@@ -72,7 +78,7 @@ func BuildCore(ctx context.Context, rt container.Runtime, agentName string, forc
 			if latestVersion != "" && av != "" && latestVersion != av {
 				ui.Infof("%s update available (%s -> %s). Rebuilding...", agentName, av, latestVersion)
 			} else {
-				if err := BuildBase(ctx, rt, false); err != nil {
+				if err := BuildBase(ctx, rt, false, d); err != nil {
 					return err
 				}
 				return nil
@@ -92,7 +98,7 @@ func BuildCore(ctx context.Context, rt container.Runtime, agentName string, forc
 	}
 
 	// Build base first
-	if err := BuildBase(ctx, rt, force); err != nil {
+	if err := BuildBase(ctx, rt, force, d); err != nil {
 		return err
 	}
 
@@ -126,13 +132,22 @@ func BuildCore(ctx context.Context, rt container.Runtime, agentName string, forc
 		Download:       downloadFile,
 		FileSHA256:     fileSHA256,
 		Logf:           ui.Infof,
+		BaseImage:      BaseImageName(d),
+		Libc:           d.LibcTag(),
+	}
+	// Alpine keeps the built-in apk steps so its Dockerfiles stay byte for
+	// byte what they were; other flavors render their own package manager.
+	if !d.IsDefault() {
+		prepareInput.Install = d.InstallSnippet
+		prepareInput.InstallInline = d.InstallCommand
+		prepareInput.Remove = d.RemoveCommand
 	}
 	if err := a.PrepareBuild(prepareInput); err != nil {
 		return err
 	}
 
 	// Add labels
-	labels := fmt.Sprintf("\nLABEL exitbox.agent=\"%s\"\nLABEL exitbox.version=\"%s\"\n", agentName, Version)
+	labels := fmt.Sprintf("\nLABEL exitbox.agent=\"%s\"\nLABEL exitbox.version=\"%s\"\nLABEL exitbox.flavor=\"%s\"\n", agentName, Version, d.ID)
 	if latestVersion != "" {
 		labels += fmt.Sprintf("LABEL exitbox.agent.version=\"%s\"\n", latestVersion)
 	}

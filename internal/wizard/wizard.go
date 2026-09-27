@@ -22,6 +22,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cloud-exit/exitbox/internal/config"
+	"github.com/cloud-exit/exitbox/internal/toolbox"
 )
 
 // SetupResult holds post-wizard actions for the caller to execute.
@@ -117,6 +118,8 @@ func RunWorkspaceCreation(existingCfg *config.Config, workspaceName string) (*Wo
 			Development: ComputeRoles(wm.Result().Roles, wm.Result().Languages),
 			Packages:    wm.Result().CustomPackages,
 			Vault:       config.VaultConfig{Enabled: wm.Result().VaultEnabled, ReadOnly: wm.Result().VaultReadOnly},
+			GPU:         wm.Result().GPU,
+			Plugins:     toPluginMap(wm.Result().Plugins),
 		},
 		MakeDefault:   wm.Result().MakeDefault,
 		CopyFrom:      wm.Result().CopyFrom,
@@ -146,6 +149,10 @@ func applyResult(state State, existingCfg *config.Config) error {
 	cfg.Roles = state.Roles
 	cfg.ToolCategories = state.ToolCategories
 	cfg.Settings.AutoUpdate = state.AutoUpdate
+	cfg.Settings.AutoUpdateTools = state.AutoUpdateTools
+	if alpine := strings.TrimSpace(state.AlpineVersion); toolbox.IsValidAlpineVersion(alpine) {
+		cfg.Settings.AlpineVersion = alpine
+	}
 	cfg.Settings.StatusBar = state.StatusBar
 	cfg.Settings.RTK = state.RTK
 	cfg.Settings.DefaultFlags = config.DefaultFlags{
@@ -169,12 +176,26 @@ func applyResult(state State, existingCfg *config.Config) error {
 		cfg.Settings.Keybindings = kb
 	}
 	cfg.Workspaces.Active = workspaceName
-	cfg.Workspaces.Items = upsertWorkspace(cfg.Workspaces.Items, config.Workspace{
+	workspace := config.Workspace{
 		Name:        workspaceName,
 		Development: development,
 		Packages:    state.CustomPackages,
 		Vault:       config.VaultConfig{Enabled: state.VaultEnabled, ReadOnly: state.VaultReadOnly},
-	})
+		GPU:         state.GPU,
+		Plugins:     toPluginMap(state.Plugins),
+	}
+	// Preserve plugin configuration the wizard never loaded (e.g. the
+	// workspace creation flow, which starts from a blank state).
+	if workspace.Plugins == nil {
+		if existing := findWorkspace(cfg.Workspaces.Items, workspaceName); existing != nil {
+			workspace.Plugins = existing.Plugins
+		}
+	}
+	// A directory-scoped workspace keeps its directory binding.
+	if existing := findWorkspace(cfg.Workspaces.Items, workspaceName); existing != nil {
+		workspace.Directory = existing.Directory
+	}
+	cfg.Workspaces.Items = upsertWorkspace(cfg.Workspaces.Items, workspace)
 	cfg.Settings.DefaultWorkspace = state.DefaultWorkspace
 
 	cfg.Agents = config.AgentConfig{}
@@ -189,6 +210,23 @@ func applyResult(state State, existingCfg *config.Config) error {
 			Name:       b.Name,
 			URLPattern: b.URLPattern,
 		})
+	}
+
+	// Persist explicit per-tool versions (empty/default entries are removed).
+	cfg.Tools.Versions = make(map[string]string)
+	for name, version := range state.ToolVersions {
+		if version != "" && version != "default" {
+			cfg.Tools.Versions[name] = version
+		}
+	}
+	// Auto-update tools acts as a shortcut for "latest" on everything that
+	// does not have an explicit pin.
+	if state.AutoUpdateTools {
+		for _, t := range toolbox.All {
+			if _, ok := cfg.Tools.Versions[t.Name]; !ok {
+				cfg.Tools.Versions[t.Name] = "latest"
+			}
+		}
 	}
 
 	// Save external tool selections and add their packages.

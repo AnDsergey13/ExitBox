@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cloud-exit/exitbox/internal/config"
+	"github.com/cloud-exit/exitbox/internal/distro"
 )
 
 func TestFormatDuration(t *testing.T) {
@@ -142,11 +143,11 @@ func TestBuildArgs_Podman(t *testing.T) {
 func TestSupportsCacheExport(t *testing.T) {
 	cases := []struct {
 		cmd, driver string
-		want         bool
+		want        bool
 	}{
-		{"podman", "", true},          // podman never needs --cache-to
-		{"docker", "docker", false},   // default driver cannot export
-		{"docker", "", false},          // unknown driver is treated as unsafe
+		{"podman", "", true},        // podman never needs --cache-to
+		{"docker", "docker", false}, // default driver cannot export
+		{"docker", "", false},       // unknown driver is treated as unsafe
 		{"docker", "docker-container", true},
 		{"docker", "remote", true},
 		{"docker", "kubernetes", true},
@@ -165,10 +166,10 @@ func TestNeedsLoad(t *testing.T) {
 		cmd, driver string
 		want        bool
 	}{
-		{"podman", "", false},          // podman loads by default
+		{"podman", "", false}, // podman loads by default
 		{"podman", "docker-container", false},
-		{"docker", "docker", false},    // default driver auto-loads
-		{"docker", "", false},           // unknown: safe default, no --load
+		{"docker", "docker", false}, // default driver auto-loads
+		{"docker", "", false},       // unknown: safe default, no --load
 		{"docker", "docker-container", true},
 		{"docker", "remote", true},
 		{"docker", "kubernetes", true},
@@ -320,8 +321,8 @@ func TestToolsHash_Deterministic(t *testing.T) {
 		},
 	}
 
-	h1 := ToolsHash(cfg)
-	h2 := ToolsHash(cfg)
+	h1 := ToolsHash(cfg, distro.Default())
+	h2 := ToolsHash(cfg, distro.Default())
 	if h1 != h2 {
 		t.Errorf("ToolsHash not deterministic: %q != %q", h1, h2)
 	}
@@ -338,8 +339,8 @@ func TestToolsHash_DifferentInputs(t *testing.T) {
 		Tools: config.ToolsConfig{User: []string{"git", "curl"}},
 	}
 
-	h1 := ToolsHash(cfg1)
-	h2 := ToolsHash(cfg2)
+	h1 := ToolsHash(cfg1, distro.Default())
+	h2 := ToolsHash(cfg2, distro.Default())
 	if h1 == h2 {
 		t.Error("ToolsHash should differ for different user tools")
 	}
@@ -355,10 +356,22 @@ func TestToolsHash_IncludesBinaries(t *testing.T) {
 		},
 	}
 
-	h1 := ToolsHash(cfg1)
-	h2 := ToolsHash(cfg2)
+	h1 := ToolsHash(cfg1, distro.Default())
+	h2 := ToolsHash(cfg2, distro.Default())
 	if h1 == h2 {
 		t.Error("ToolsHash should differ when binaries are added")
+	}
+}
+
+func TestToolsHash_IncludesToolVersions(t *testing.T) {
+	cfg1 := &config.Config{}
+	cfg2 := &config.Config{}
+	cfg2.SetToolVersion("go", "1.35.0")
+
+	h1 := ToolsHash(cfg1, distro.Default())
+	h2 := ToolsHash(cfg2, distro.Default())
+	if h1 == h2 {
+		t.Error("ToolsHash should differ when tool versions are added")
 	}
 }
 
@@ -368,8 +381,8 @@ func TestToolsHash_IncludesExternalTools(t *testing.T) {
 		ExternalTools: []string{"Bun"},
 	}
 
-	h1 := ToolsHash(cfg1)
-	h2 := ToolsHash(cfg2)
+	h1 := ToolsHash(cfg1, distro.Default())
+	h2 := ToolsHash(cfg2, distro.Default())
 	if h1 == h2 {
 		t.Error("ToolsHash should differ when external tools are added")
 	}
@@ -379,8 +392,8 @@ func TestWorkspaceHash_Deterministic(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dir := t.TempDir()
 
-	h1 := WorkspaceHash(cfg, dir, "")
-	h2 := WorkspaceHash(cfg, dir, "")
+	h1 := WorkspaceHash(cfg, "codex", dir, "")
+	h2 := WorkspaceHash(cfg, "codex", dir, "")
 	if h1 != h2 {
 		t.Errorf("WorkspaceHash not deterministic: %q != %q", h1, h2)
 	}
@@ -390,7 +403,7 @@ func TestWorkspaceHash_Format(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dir := t.TempDir()
 
-	h := WorkspaceHash(cfg, dir, "")
+	h := WorkspaceHash(cfg, "codex", dir, "")
 	if len(h) != 16 {
 		t.Errorf("WorkspaceHash length = %d, want 16", len(h))
 	}
@@ -412,10 +425,64 @@ func TestWorkspaceHash_ExcludesGlobalTools(t *testing.T) {
 		{Name: "mytool", URLPattern: "https://example.com/{arch}/mytool"},
 	}
 
-	h1 := WorkspaceHash(cfg1, dir, "")
-	h2 := WorkspaceHash(cfg2, dir, "")
+	h1 := WorkspaceHash(cfg1, "codex", dir, "")
+	h2 := WorkspaceHash(cfg2, "codex", dir, "")
 	if h1 != h2 {
 		t.Error("WorkspaceHash should NOT change when only global tools/binaries change (those are in tools layer)")
+	}
+}
+
+func TestToolsHash_IncludesAlpineVersion(t *testing.T) {
+	cfg1 := &config.Config{}
+	cfg2 := &config.Config{}
+	cfg2.Settings.AlpineVersion = "3.24"
+
+	if ToolsHash(cfg1, distro.Default()) == ToolsHash(cfg2, distro.Default()) {
+		t.Error("ToolsHash should differ when the Alpine base image changes")
+	}
+}
+
+func TestWorkspaceHash_IncludesAlpineVersion(t *testing.T) {
+	dir := t.TempDir()
+	cfg1 := config.DefaultConfig()
+	cfg2 := config.DefaultConfig()
+	cfg2.Settings.AlpineVersion = "3.24"
+
+	if WorkspaceHash(cfg1, "codex", dir, "") == WorkspaceHash(cfg2, "codex", dir, "") {
+		t.Error("WorkspaceHash should differ when the Alpine base image changes")
+	}
+}
+
+func TestTemplateBaseDockerfile(t *testing.T) {
+	cfg := config.DefaultConfig()
+	df := string(templateBaseDockerfile(cfg, distro.Default()))
+	if !strings.Contains(df, "FROM docker.io/library/alpine:3.21") {
+		t.Errorf("default base Dockerfile missing FROM docker.io/library/alpine:3.21:\n%s", df)
+	}
+	if !strings.Contains(df, `LABEL exitbox.alpine="3.21"`) {
+		t.Errorf("default base Dockerfile missing Alpine label:\n%s", df)
+	}
+
+	cfg.Settings.AlpineVersion = "3.24"
+	df = string(templateBaseDockerfile(cfg, distro.Default()))
+	if !strings.Contains(df, "FROM docker.io/library/alpine:3.24") {
+		t.Errorf("configured base Dockerfile missing FROM docker.io/library/alpine:3.24:\n%s", df)
+	}
+	if strings.Contains(df, "FROM docker.io/library/alpine:3.21") {
+		t.Errorf("configured base Dockerfile still contains default FROM:\n%s", df)
+	}
+}
+
+func TestWorkspaceHash_IncludesToolVersions(t *testing.T) {
+	dir := t.TempDir()
+	cfg1 := config.DefaultConfig()
+	cfg2 := config.DefaultConfig()
+	cfg2.SetToolVersion("go", "1.35.0")
+
+	h1 := WorkspaceHash(cfg1, "codex", dir, "")
+	h2 := WorkspaceHash(cfg2, "codex", dir, "")
+	if h1 == h2 {
+		t.Error("WorkspaceHash should differ when tool versions are added")
 	}
 }
 
@@ -423,11 +490,11 @@ func TestWorkspaceHash_IncludesSessionTools(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.DefaultConfig()
 
-	h1 := WorkspaceHash(cfg, dir, "")
+	h1 := WorkspaceHash(cfg, "codex", dir, "")
 
 	oldTools := SessionTools
 	SessionTools = []string{"extra-pkg"}
-	h2 := WorkspaceHash(cfg, dir, "")
+	h2 := WorkspaceHash(cfg, "codex", dir, "")
 	SessionTools = oldTools
 
 	if h1 == h2 {

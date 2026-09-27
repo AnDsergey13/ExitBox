@@ -26,25 +26,56 @@ import (
 
 	"github.com/cloud-exit/exitbox/internal/config"
 	"github.com/cloud-exit/exitbox/internal/container"
+	"github.com/cloud-exit/exitbox/internal/distro"
+	"github.com/cloud-exit/exitbox/internal/plugins"
 	"github.com/cloud-exit/exitbox/internal/profile"
 	proj "github.com/cloud-exit/exitbox/internal/project"
+	"github.com/cloud-exit/exitbox/internal/toolbox"
 	"github.com/cloud-exit/exitbox/internal/ui"
 )
 
+// WorkspaceDistro returns the image flavor a workspace builds on.
+func WorkspaceDistro(cfg *config.Config, projectDir, overrideName string) *distro.Distro {
+	ws := activeWorkspace(cfg, projectDir, overrideName)
+	return distro.For(ws != nil && ws.GPU)
+}
+
+// activeWorkspace resolves the workspace a build or run applies to, or nil
+// when the config has no workspaces.
+func activeWorkspace(cfg *config.Config, projectDir, overrideName string) *config.Workspace {
+	active, _ := profile.ResolveActiveWorkspace(cfg, projectDir, overrideName)
+	if active == nil {
+		return nil
+	}
+	return &active.Workspace
+}
+
 // WorkspaceHash computes a short hash encoding the active workspace
-// configuration. Each distinct workspace produces a different hash,
-// which becomes part of the image name. Global tool config (cfg.Tools.User,
-// cfg.Tools.Binaries) is NOT included — those live in the shared tools
-// layer and are tracked via its own hash/label.
-func WorkspaceHash(cfg *config.Config, projectDir string, overrideName string) string {
+// configuration for an agent. Each distinct workspace produces a different
+// hash, which becomes part of the image name. Global tool config
+// (cfg.Tools.User, cfg.Tools.Binaries) is NOT included — those live in the
+// shared tools layer and are tracked via its own hash/label. The workspace's
+// enabled plugins are included so switching a plugin on or off lands on a
+// different project image instead of reusing a stale one.
+func WorkspaceHash(cfg *config.Config, agentName, projectDir string, overrideName string) string {
 	active, _ := profile.ResolveActiveWorkspace(cfg, projectDir, overrideName)
 	var parts []string
 	if active != nil {
 		parts = append(parts, active.Scope, active.Workspace.Name)
 		parts = append(parts, active.Workspace.Development...)
 		parts = append(parts, active.Workspace.Packages...)
+		if ph := plugins.BuildHash(&active.Workspace, agentName); ph != "" {
+			parts = append(parts, "plugins="+ph)
+		}
+		if active.Workspace.GPU {
+			parts = append(parts, "gpu=true")
+		}
 	}
 	parts = append(parts, SessionTools...)
+	parts = append(parts, "alpine="+validAlpineVersion(cfg.AlpineVersionOrDefault()))
+	if versions := toolbox.SortedVersions(cfg); versions != "" {
+		parts = append(parts, versions)
+	}
 	h := sha256.Sum256([]byte(strings.Join(parts, ",")))
 	return fmt.Sprintf("%x", h[:8])
 }
@@ -54,25 +85,36 @@ func WorkspaceHash(cfg *config.Config, projectDir string, overrideName string) s
 // workspaceOverride selects a specific workspace (empty = use resolution chain).
 func BuildProject(ctx context.Context, rt container.Runtime, agentName, projectDir, workspaceOverride string, force bool) error {
 	cfg := config.LoadOrDefault()
-	wh := WorkspaceHash(cfg, projectDir, workspaceOverride)
+	wh := WorkspaceHash(cfg, agentName, projectDir, workspaceOverride)
 	imageName := proj.ImageName(agentName, projectDir, wh)
-	toolsImage := fmt.Sprintf("exitbox-%s-tools", agentName)
 	cmd := container.Cmd(rt)
 
+	// A GPU workspace builds on the glibc CUDA flavor; everything else on
+	// Alpine.
+	d := WorkspaceDistro(cfg, projectDir, workspaceOverride)
+
 	// Ensure tools image exists (tools → core → base cascade)
-	if err := BuildTools(ctx, rt, agentName, force); err != nil {
+	if err := BuildTools(ctx, rt, agentName, force, d); err != nil {
+		return err
+	}
+
+	// Plugins layer sits between tools and project. With no plugins enabled
+	// this is the tools image itself.
+	baseImage, err := BuildPlugins(ctx, rt, agentName, projectDir, workspaceOverride, force, d)
+	if err != nil {
 		return err
 	}
 
 	// Each workspace has its own image name. If it already exists, skip.
 	if !force && rt.ImageExists(imageName) {
-		// Check if tools is newer (e.g. user changed tool categories)
-		toolsCreated, _ := rt.ImageInspect(toolsImage, "{{.Created}}")
+		// Check if the layer below is newer (e.g. user changed tool
+		// categories, or a plugin was rebuilt).
+		baseCreated, _ := rt.ImageInspect(baseImage, "{{.Created}}")
 		projectCreated, _ := rt.ImageInspect(imageName, "{{.Created}}")
-		if toolsCreated == "" || projectCreated == "" || toolsCreated <= projectCreated {
+		if baseCreated == "" || projectCreated == "" || baseCreated <= projectCreated {
 			return nil
 		}
-		ui.Info("Tools image updated, rebuilding project image...")
+		ui.Info("Base image updated, rebuilding project image...")
 	}
 
 	// Resolve active workspace.
@@ -96,7 +138,7 @@ func BuildProject(ctx context.Context, rt container.Runtime, agentName, projectD
 	var df strings.Builder
 
 	df.WriteString("# syntax=docker/dockerfile:1\n")
-	fmt.Fprintf(&df, "FROM %s\n\n", toolsImage)
+	fmt.Fprintf(&df, "FROM %s\n\n", baseImage)
 
 	// Switch to root for package installation (tools image stays as root,
 	// but be explicit in case that changes)
@@ -115,17 +157,33 @@ func BuildProject(ctx context.Context, rt container.Runtime, agentName, projectD
 	if active != nil {
 		allPkgs = append(allPkgs, active.Workspace.Packages...)
 	}
-	allPkgs = append(allPkgs, profile.CollectPackages(developmentProfiles)...)
+	allPkgs = append(allPkgs, profile.CollectVersionedPackages(developmentProfiles, cfg.Tools.Versions)...)
 	allPkgs = append(allPkgs, SessionTools...)
+	if active != nil && active.Workspace.GPU && d.IsDefault() {
+		// A GPU workspace on the Alpine flavor (the user pinned it) at least
+		// gets the glibc shim, so the injected driver userspace has a chance.
+		allPkgs = append(allPkgs, GPUCompatPackages...)
+	}
 	allPkgs = dedup(allPkgs)
 
 	if len(allPkgs) > 0 {
-		fmt.Fprintf(&df, "RUN --mount=type=cache,target=/var/cache/apk apk add --no-cache %s\n\n", strings.Join(allPkgs, " "))
+		mapped, unavailable := d.Packages(allPkgs)
+		if len(mapped) > 0 {
+			fmt.Fprintf(&df, "%s\n\n", d.InstallSnippet(allPkgs))
+		}
+		for _, name := range unavailable {
+			fb, ok := distro.BinaryFallbacks[name]
+			if !ok {
+				ui.Warnf("%s has no package for %q; it is not installed in this workspace image", d.DisplayName, name)
+				continue
+			}
+			fmt.Fprintf(&df, "# %s (no %s package, official binary)\n%s\n\n", name, d.DisplayName, distro.BinaryInstallSnippet(name, fb))
+		}
 	}
 
 	// Add non-apk custom install steps (Go download, Python venv, etc.).
 	for _, p := range developmentProfiles {
-		snippet := profile.CustomSnippet(p)
+		snippet := profile.CustomSnippet(p, cfg.Tools.Versions)
 		if snippet != "" {
 			df.WriteString(snippet)
 			df.WriteString("\n")
@@ -159,6 +217,11 @@ func BuildProject(ctx context.Context, rt container.Runtime, agentName, projectD
 	ui.Successf("%s project image built", agentName)
 	return nil
 }
+
+// GPUCompatPackages are added to a GPU-enabled workspace image so the
+// driver userspace injected by the container toolkit has its glibc shim and
+// C++ runtime available.
+var GPUCompatPackages = []string{"gcompat", "libstdc++"}
 
 // dedup returns a new slice with duplicate strings removed, preserving order.
 func dedup(in []string) []string {

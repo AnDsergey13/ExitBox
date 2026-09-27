@@ -16,7 +16,12 @@
 
 package profile
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/cloud-exit/exitbox/internal/toolbox"
+)
 
 // Packages returns the space-separated Alpine packages for a role,
 // or empty string if the role has none or only custom install steps.
@@ -34,29 +39,94 @@ func Packages(name string) string {
 }
 
 // CollectPackages returns a deduplicated list of all Alpine packages
-// needed by the given profiles.
+// needed by the given profiles, without version pins.
 func CollectPackages(profiles []string) []string {
+	return CollectVersionedPackages(profiles, nil)
+}
+
+// CollectVersionedPackages returns a deduplicated list of all Alpine
+// packages needed by the given profiles, applying configured tool version
+// pins. Alpine packages owned by a tarball-installed tool (e.g. Go) are
+// omitted when that tool has a version configured, and apk-managed tools
+// are emitted as pkg=version when an exact version is pinned.
+func CollectVersionedPackages(profiles []string, versions map[string]string) []string {
 	seen := make(map[string]bool)
 	var pkgs []string
+
 	for _, name := range profiles {
 		raw := Packages(name)
-		if raw == "" {
-			continue
+		t := toolbox.LookupByRole(name)
+		ver := ""
+		if t != nil {
+			ver = versionFor(versions, t.Name)
 		}
-		for _, pkg := range strings.Fields(raw) {
-			if !seen[pkg] {
-				seen[pkg] = true
-				pkgs = append(pkgs, pkg)
+
+		rawFields := strings.Fields(raw)
+		for _, p := range rawFields {
+			if seen[p] {
+				continue
+			}
+			// Tarball-installed tools replace their apk package when a
+			// version (including "latest") is configured.
+			if t != nil && t.Mode == toolbox.ModeTarball && ver != "" && t.OwnsPackage(p) {
+				seen[p] = true
+				continue
+			}
+			spec := p
+			if t != nil && t.Mode == toolbox.ModeApk && ver != "" && ver != "latest" && t.OwnsPackage(p) {
+				spec = p + "=" + ver
+			}
+			seen[p] = true
+			pkgs = append(pkgs, spec)
+		}
+		// Some apk-managed languages (e.g. python) are provided by the base
+		// image rather than the role's package list. Add an explicit install
+		// (pinned or latest) when the tool is active.
+		if t != nil && t.Mode == toolbox.ModeApk && ver != "" {
+			for _, p := range t.Packages {
+				if seen[p] || contains(rawFields, p) {
+					continue
+				}
+				spec := p
+				if ver != "latest" {
+					spec = p + "=" + ver
+				}
+				seen[p] = true
+				pkgs = append(pkgs, spec)
 			}
 		}
 	}
 	return pkgs
 }
 
+// contains reports whether list contains s.
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// versionFor returns the configured version for name, or "" when no map is
+// provided or the entry is "default".
+func versionFor(versions map[string]string, name string) string {
+	if versions == nil {
+		return ""
+	}
+	v := versions[name]
+	if v == "default" || v == "" {
+		return ""
+	}
+	return v
+}
+
 // CustomSnippet returns the non-apk Dockerfile instructions for a profile
 // (e.g. Go download, Python venv, Flutter install, node npm globals).
+// versions carries the configured tool version pins.
 // Returns empty string if the profile only needs apk packages.
-func CustomSnippet(name string) string {
+func CustomSnippet(name string, versions map[string]string) string {
 	switch name {
 	case "python":
 		return `# Python profile - venv with pip, setuptools, wheel
@@ -65,20 +135,13 @@ RUN python3 -m venv /home/user/.venv && \
 ENV PATH="/home/user/.venv/bin:$PATH"
 `
 	case "go":
-		return `# Go profile - compiler and gofmt are installed via apk package "go".
-RUN set -e && \
-    case "$(uname -m)" in \
-        x86_64|amd64) LINT_ARCH="amd64" ;; \
-        aarch64|arm64) LINT_ARCH="arm64" ;; \
-        *) echo "Unsupported architecture" >&2; exit 1 ;; \
-    esac && \
-    LINT_VERSION="v1.64.8" && \
-    wget -q -O /tmp/golangci-lint.tar.gz "https://github.com/golangci/golangci-lint/releases/download/${LINT_VERSION}/golangci-lint-${LINT_VERSION#v}-linux-${LINT_ARCH}.tar.gz" && \
-    tar -xzf /tmp/golangci-lint.tar.gz -C /tmp && \
-    mv /tmp/golangci-lint-${LINT_VERSION#v}-linux-${LINT_ARCH}/golangci-lint /usr/local/bin/golangci-lint && \
-    chmod +x /usr/local/bin/golangci-lint && \
-    rm -rf /tmp/golangci-lint*
-`
+		var b strings.Builder
+		if v := versionFor(versions, "go"); v != "" {
+			b.WriteString(goSnippet(v))
+			b.WriteString("\n")
+		}
+		b.WriteString(golangciLintSnippet(versionFor(versions, "golangci-lint")))
+		return b.String()
 	case "flutter":
 		return `RUN set -e && \
     case "$(uname -m)" in \
@@ -118,11 +181,70 @@ RUN /home/user/.venv/bin/pip install --no-cache-dir \
 	return ""
 }
 
+// goSnippet installs the official Go toolchain from go.dev. version may be
+// an exact version like "1.35.0" or "latest" to resolve during image build.
+func goSnippet(version string) string {
+	if version == "" {
+		return ""
+	}
+	resolve := ""
+	goVersion := version
+	if version == "latest" {
+		resolve = "    GO_VERSION=\"$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1 | sed 's/^go//')\" && \\\n"
+		goVersion = "${GO_VERSION}"
+	}
+	return fmt.Sprintf(`# Go profile - official Go toolchain (%s)
+RUN set -e && \
+    case "$(uname -m)" in \
+        x86_64|amd64) GO_ARCH="amd64" ;; \
+        aarch64|arm64) GO_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac && \
+%s    GO_FILE="go%s.linux-${GO_ARCH}.tar.gz" && \
+    GO_SHA256="$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | jq -r --arg f "$GO_FILE" '.[] | .files[] | select(.filename == $f) | .sha256')" && \
+    test -n "$GO_SHA256" && \
+    curl -fsSL "https://go.dev/dl/$GO_FILE" -o "/tmp/$GO_FILE" && \
+    echo "${GO_SHA256}  /tmp/${GO_FILE}" | sha256sum -c - && \
+    rm -rf /usr/local/go && \
+    tar -C /usr/local -xzf "/tmp/$GO_FILE" && \
+    rm -f "/tmp/$GO_FILE" && \
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go && \
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt && \
+    go version
+`, version, resolve, goVersion)
+}
+
+// golangciLintSnippet installs golangci-lint from GitHub releases. An empty
+// version uses the built-in default; "latest" resolves during image build.
+func golangciLintSnippet(version string) string {
+	if version == "" {
+		version = "1.64.8"
+	}
+	assign := `LINT_VERSION="` + version + `"`
+	if version == "latest" {
+		assign = `LINT_VERSION="$(curl -fsSL https://api.github.com/repos/golangci/golangci-lint/releases/latest | jq -r '.tag_name | ltrimstr("v")')"`
+	}
+	return fmt.Sprintf(`# golangci-lint (v%s)
+RUN set -e && \
+    case "$(uname -m)" in \
+        x86_64|amd64) LINT_ARCH="amd64" ;; \
+        aarch64|arm64) LINT_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture" >&2; exit 1 ;; \
+    esac && \
+    %s && \
+    wget -q -O /tmp/golangci-lint.tar.gz "https://github.com/golangci/golangci-lint/releases/download/v${LINT_VERSION}/golangci-lint-${LINT_VERSION}-linux-${LINT_ARCH}.tar.gz" && \
+    tar -xzf /tmp/golangci-lint.tar.gz -C /tmp && \
+    mv /tmp/golangci-lint-${LINT_VERSION}-linux-${LINT_ARCH}/golangci-lint /usr/local/bin/golangci-lint && \
+    chmod +x /usr/local/bin/golangci-lint && \
+    rm -rf /tmp/golangci-lint*
+`, version, assign)
+}
+
 // DockerfileSnippet returns the full Dockerfile instructions for a profile.
 // Deprecated: use CollectPackages + CustomSnippet for batched apk installs.
 func DockerfileSnippet(name string) string {
 	pkgs := Packages(name)
-	custom := CustomSnippet(name)
+	custom := CustomSnippet(name, nil)
 
 	var parts []string
 	if pkgs != "" {

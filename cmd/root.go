@@ -36,6 +36,7 @@ var skipWizardCommands = map[string]bool{
 	"help":       true,
 	"completion": true,
 	"update":     true,
+	"tools":      true,
 }
 
 var rootCmd = &cobra.Command{
@@ -46,8 +47,12 @@ var rootCmd = &cobra.Command{
 		v, _ := cmd.Flags().GetBool("verbose")
 		ui.Verbose = v
 
-		// Trigger setup wizard on first run
-		if !config.ConfigExists() && !skipWizardCommands[cmd.Name()] {
+		// Trigger setup wizard on first run (tools subcommands never do).
+		parent := ""
+		if cmd.Parent() != nil {
+			parent = cmd.Parent().Name()
+		}
+		if !config.ConfigExists() && !skipWizardCommands[cmd.Name()] && !skipWizardCommands[parent] {
 			ui.Info("No configuration found. Running setup wizard...")
 			fmt.Println()
 			if err := runSetup(); err != nil {

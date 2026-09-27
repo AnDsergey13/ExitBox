@@ -75,6 +75,7 @@ var listCmd = &cobra.Command{
 		fmt.Println("  exitbox rebuild all        Rebuild all enabled agents")
 		fmt.Println("  exitbox import <agent>     Import agent config from host")
 		fmt.Println("  exitbox skills  	          Install, list, and remove skills for AI coding agents")
+		fmt.Println("  exitbox tools               List and update tools and languages")
 		fmt.Println("  exitbox workspaces         Manage workspaces")
 		fmt.Println("  exitbox sessions           Manage sessions")
 		fmt.Println("  exitbox vault              Manage vault secrets")
